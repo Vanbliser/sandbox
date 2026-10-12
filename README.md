@@ -1,11 +1,8 @@
 # sandbox
 
-The sandbox tool is specifically built to run AI pentesting agents in isolated environments on your Mac machine. It is build with the Apple `container` microVM and a host-side firewall. Each sandbox has two lists you control:
+The sandbox tool is specifically built to run AI pentesting agents in isolated environments on your Mac machine. It is build with the Apple `container` microVM and a host-side firewall.
 
-- **`domains.txt`**: which websites the sandbox may reach, through a checking proxy
-- **`ips.txt`**: which addresses it may reach with network tools (`ping`, `traceroute`, `nmap`)
-
-Every sandbox logs what it tried, and you can cut its network or stop it at any time: `sandbox logs` shows only what the sandbox sent or tried to send.
+Every sandbox logs what it tried, and you can cut its network or stop it at any time
 
 
 ## The components
@@ -114,7 +111,12 @@ Define your targets first, in one or both files. Then pass them to `up`:
 sandbox up app1 -d my-domains.txt -i my-ips.txt
 ```
 
-Or leave out the files and load them afterwards. In such case, `up` creates empty my-domains.txt and my-ips.lists:
+Each sandbox has two lists you control:
+
+- **`domains.txt`**: which websites the sandbox may reach, through a checking proxy
+- **`ips.txt`**: which addresses it may reach with network tools (`ping`, `traceroute`, `nmap`) that make direct conections
+
+Or leave out the files and load them afterwards. In such case, `sandbox up` creates empty my-domains.txt and my-ips.lists:
 
 ```bash
 sandbox up app1
@@ -352,7 +354,7 @@ Squid needs PEM, so it is concerted to PEM when it stores the file.
 | `sandbox verify <name>` | Run the containment checks, an upstream proxy check (e.g Burpsuite), PASS or FAIL for each |
 | `sandbox shell <name>` | Open a shell inside the sandbox |
 | `sandbox strict <name> on\|off` | Switch strict Host/SNI checking (web and both) |
-| `sandbox logs <name> [-f]` | Web decisions (proxy) and network decisions (pf), or follow them live |
+| `sandbox logs <name> [-f]` | Web decisions (proxy) and network decisions (pf), or follow them live. It shows only what the sandbox sent or tried to send |
 | `sandbox down <name>` | Stop the container, proxy and rules. Keeps the state |
 | `sandbox upstream <name> [<upstream_ip:port> <DER_ca_file> \| none]` | Sends web traffic to an upstream proxy, such as Burp. `none` unsets it |
 | `sandbox start <name>` | brings back a sandbox that sandbox down has stopped. reusing the kept state |
