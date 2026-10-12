@@ -8,49 +8,34 @@ Run AI agents, including pentesting agents, inside an Apple `container` microVM 
 
 Every sandbox logs what it tried, and you can cut its network or stop it at any time.
 
-## Choosing a mode
+## The components
 
-| | web | network | both |
-|---|---|---|---|
-| Requires | `--domains` | `--ips` | `--domains` and `--ips` |
-| Web (HTTP and HTTPS) | Allowed hosts only, through the proxy | Not allowed by name. Raw connections to listed addresses on any port, web ports included | Allowed hosts only, through the proxy |
-| `ping`, `traceroute` | Blocked | Allowed to listed addresses | Allowed to listed addresses |
-| `nmap` on non-web ports | Blocked | Allowed to listed addresses | Allowed to listed addresses |
-| `nmap` on ports 80 and 443 | Blocked | Allowed to listed addresses | Blocked, so web scans don't reach targets |
-| Logging | Every web request (proxy log), and every pf decision (network log) | Every pf decision (network log) | Both logs |
-| Domain check on web | Yes | No | Yes |
-| `--strict` | Yes | Not applicable | Yes |
-| DNS for the sandbox | Blocked | Blocked | Blocked |
-| Host protection | Yes | Yes | Yes |
+Each piece below does one job. Here's what each one is and what the script does with it.
 
-When you start a sandbox, `sandbox up` prints a short note describing the path you chose.
+**Apple `container` CLI.** Runs the sandbox as a lightweight virtual machine with its own kernel. The script creates a network per sandbox with `container network create`, starts the sandbox with `container run`, reads its gateway address with `container inspect`, and runs commands in it with `container exec`. Installing it is manual, from Apple's releases page.
 
-## What's enforced
+**pf (macOS packet filter).** The firewall in the macOS kernel. It decides which packets leave the sandbox's bridge. Every rule the script writes lives in its own anchor, `com.apple/sandbox-<name>`, so it never touches your system rules or your own traffic. The rules are default-deny, with exceptions for the proxy port, the raw-traffic addresses, and nothing else. pf also blocks the sandbox from the host's own services.
 
-| Control | How |
-|---|---|
-| Isolation | Each sandbox is an Apple `container` microVM with its own kernel and network |
-| Default deny | pf blocks all traffic from the sandbox, except the paths the mode allows |
-| Proxy path | Web requests go to Squid, which checks each one against `domains.txt` |
-| Host protection | The sandbox can't reach the host's services, including SSH |
-| DNS | Blocked for the sandbox. Names are resolved on the host, by the proxy |
-| Visibility | Web decisions are logged by the proxy (`access.log`). Network decisions are logged by pf, one record per packet, grouped per flow by `sandbox logs` |
-| Kill switch | `down` cuts the network and stops the container. `destroy` removes everything |
-| Strict mode | Decrypts HTTPS and requires the TLS name and the Host header to match |
+**The bridge.** A virtual network interface on the host, one per sandbox. The sandbox's traffic enters the host through it, which is where pf filters it. The script finds the bridge by looking up the gateway address, not by name, because macOS reuses bridge names.
 
-## What's not covered
+**`pflog0` and the network log.** `pflog0` is macOS's interface for pf's log records. The helper creates it when it's missing. Each pf rule that matters has the `log` keyword, so every allow and block is recorded. A root-owned `tcpdump` reads `pflog0` and writes to the sandbox's `pflog.txt`. `sandbox logs` groups those records into one line per flow, with the verdict, the protocol, the addresses and a count.
 
-Read these before relying on a sandbox:
+**Squid.** The web proxy, installed with Homebrew. The script generates one configuration per sandbox and runs one Squid process for each. It listens on the sandbox's gateway address, on port 3128, and checks each connection against `domains.txt`. Connections to listed hosts pass through unchanged. In strict mode, Squid decrypts them and checks the Host header. Squid also writes `access.log`.
 
-- **Web traffic to addresses in network mode, and to the addresses in both mode on non-web ports, is not checked by name.** Those connections go straight to the address, so the proxy never sees them.
-- **nmap can't scan web ports through the proxy.** In both mode, web ports on listed addresses are closed to raw traffic on purpose. Web testing uses the domains list.
-- **Other HTTP services bypass the check.** A web app on port 8080 or 8000 is not a web port in the rules, so it goes raw in network mode and in the non-web part of both mode. The rules can't see what protocol runs on a port.
-- **Shared-hosting addresses serve other sites.** A listed address on a CDN can serve sites you never approved, and raw traffic reaches them too.
-- **Pinned clients.** Trust and pinning are separate. Pinning means the client accepts only one specific certificate, even one from a trusted authority. Strict mode replaces the target's certificate, so a pinned client fails there. Default mode passes HTTPS through untouched, so pinned clients work. Direct-IP connections are always decrypted, so pinned clients can fail on those. There's no per-host exemption from strict mode yet.
-- **Trust follows the Mac.** `init` copies the trust roots from this Mac's keychains into the image. If your network inspects HTTPS, your company's root is included, so the sandbox trusts what your Mac trusts.
-- **Credentials.** Logins and API keys live inside the sandbox. An agent that reads them can send them to any reachable host. Use test accounts, and keep the lists tight.
-- **Port restrictions on the proxy.** The domain list matches hostnames, not ports.
-- **Anything inside an allowed host.** Allowed sites are reachable in full. Scope is still the operator's job.
+**The sandbox CA.** A certificate authority created on your Mac by `init`. Squid uses it to present certificates in strict mode, and the sandbox image trusts it. The private key never leaves `~/.sandbox/ca/`.
+
+**The image.** A Linux image built by `init` with `container build`. It contains curl, Node, npm and nmap. It trusts the sandbox CA and the roots exported from your Mac's keychains. The keychain roots are how a sandbox trusts the same sites your Mac does.
+
+**The privileged helper** (`/usr/local/libexec/sandbox-pf`). The only root-owned part of the tool. The script calls it through sudo to load, show and flush the pf anchor. It validates every argument: the sandbox name, the subnet, the mode and each address. It builds the rules itself and never accepts rule text. It can only change `com.apple/sandbox-*` anchors.
+
+**The sudo rule** (`/etc/sudoers.d/sandbox`). Lets your user run the helper's `load` and `show` without a password. `flush` still asks for your password.
+
+**The Host-check helper** (`~/.sandbox/bin/check-host.sh`). Squid calls it for each request in strict mode. It compares the Host header and TLS name against `domains.txt`, and in default mode it checks the destination address against the names' DNS answers.
+
+**dig, python3 and the system tools.** `dig` resolves names for the Host-check helper. `python3` converts IP ranges to CIDR blocks. `ifconfig`, `netstat` and `pgrep` find free subnets, bridges and proxy processes. `security` exports the keychain roots. `nc` and `curl` run the containment checks.
+
+**`~/.sandbox/`** holds the state of each sandbox. Per sandbox: `state.json`, the policy files, `squid.conf`, `access.log`, and the rules' input files.
+
 
 ## Requirements
 
@@ -189,33 +174,6 @@ sandbox strict app1 off                                         # switch back
 
 Changes apply to new connections.
 
-## The components
-
-Each piece below does one job. Here's what each one is and what the script does with it.
-
-**Apple `container` CLI.** Runs the sandbox as a lightweight virtual machine with its own kernel. The script creates a network per sandbox with `container network create`, starts the sandbox with `container run`, reads its gateway address with `container inspect`, and runs commands in it with `container exec`. Installing it is manual, from Apple's releases page.
-
-**pf (macOS packet filter).** The firewall in the macOS kernel. It decides which packets leave the sandbox's bridge. Every rule the script writes lives in its own anchor, `com.apple/sandbox-<name>`, so it never touches your system rules or your own traffic. The rules are default-deny, with exceptions for the proxy port, the raw-traffic addresses, and nothing else. pf also blocks the sandbox from the host's own services.
-
-**The bridge.** A virtual network interface on the host, one per sandbox. The sandbox's traffic enters the host through it, which is where pf filters it. The script finds the bridge by looking up the gateway address, not by name, because macOS reuses bridge names.
-
-**`pflog0` and the network log.** `pflog0` is macOS's interface for pf's log records. The helper creates it when it's missing. Each pf rule that matters has the `log` keyword, so every allow and block is recorded. A root-owned `tcpdump` reads `pflog0` and writes to the sandbox's `pflog.txt`. `sandbox logs` groups those records into one line per flow, with the verdict, the protocol, the addresses and a count.
-
-**Squid.** The web proxy, installed with Homebrew. The script generates one configuration per sandbox and runs one Squid process for each. It listens on the sandbox's gateway address, on port 3128, and checks each connection against `domains.txt`. Connections to listed hosts pass through unchanged. In strict mode, Squid decrypts them and checks the Host header. Squid also writes `access.log`.
-
-**The sandbox CA.** A certificate authority created on your Mac by `init`. Squid uses it to present certificates in strict mode, and the sandbox image trusts it. The private key never leaves `~/.sandbox/ca/`.
-
-**The image.** A Linux image built by `init` with `container build`. It contains curl, Node, npm and nmap. It trusts the sandbox CA and the roots exported from your Mac's keychains. The keychain roots are how a sandbox trusts the same sites your Mac does.
-
-**The privileged helper** (`/usr/local/libexec/sandbox-pf`). The only root-owned part of the tool. The script calls it through sudo to load, show and flush the pf anchor. It validates every argument: the sandbox name, the subnet, the mode and each address. It builds the rules itself and never accepts rule text. It can only change `com.apple/sandbox-*` anchors.
-
-**The sudo rule** (`/etc/sudoers.d/sandbox`). Lets your user run the helper's `load` and `show` without a password. `flush` still asks for your password.
-
-**The Host-check helper** (`~/.sandbox/bin/check-host.sh`). Squid calls it for each request in strict mode. It compares the Host header and TLS name against `domains.txt`, and in default mode it checks the destination address against the names' DNS answers.
-
-**dig, python3 and the system tools.** `dig` resolves names for the Host-check helper. `python3` converts IP ranges to CIDR blocks. `ifconfig`, `netstat` and `pgrep` find free subnets, bridges and proxy processes. `security` exports the keychain roots. `nc` and `curl` run the containment checks.
-
-**`~/.sandbox/`** holds the state of each sandbox. Per sandbox: `state.json`, the policy files, `squid.conf`, `access.log`, and the rules' input files.
 
 ## What `up` does, in order
 
@@ -251,6 +209,51 @@ If any step fails, the rollback stops Squid, flushes the pf rules, removes the c
   archive/                  destroyed sandboxes
   failed/                   logs from sandboxes that failed to start
 ```
+
+## Choosing a mode
+
+| | web | network | both |
+|---|---|---|---|
+| Requires | `--domains` | `--ips` | `--domains` and `--ips` |
+| Web (HTTP and HTTPS) | Allowed hosts only, through the proxy | Not allowed by name. Raw connections to listed addresses on any port, web ports included | Allowed hosts only, through the proxy |
+| `ping`, `traceroute` | Blocked | Allowed to listed addresses | Allowed to listed addresses |
+| `nmap` on non-web ports | Blocked | Allowed to listed addresses | Allowed to listed addresses |
+| `nmap` on ports 80 and 443 | Blocked | Allowed to listed addresses | Blocked, so web scans don't reach targets |
+| Logging | Every web request (proxy log), and every pf decision (network log) | Every pf decision (network log) | Both logs |
+| Domain check on web | Yes | No | Yes |
+| `--strict` | Yes | Not applicable | Yes |
+| DNS for the sandbox | Blocked | Blocked | Blocked |
+| Host protection | Yes | Yes | Yes |
+
+When you start a sandbox, `sandbox up` prints a short note describing the path you chose.
+
+## What's enforced
+
+| Control | How |
+|---|---|
+| Isolation | Each sandbox is an Apple `container` microVM with its own kernel and network |
+| Default deny | pf blocks all traffic from the sandbox, except the paths the mode allows |
+| Proxy path | Web requests go to Squid, which checks each one against `domains.txt` |
+| Host protection | The sandbox can't reach the host's services, including SSH |
+| DNS | Blocked for the sandbox. Names are resolved on the host, by the proxy |
+| Visibility | Web decisions are logged by the proxy (`access.log`). Network decisions are logged by pf, one record per packet, grouped per flow by `sandbox logs` |
+| Kill switch | `down` cuts the network and stops the container. `destroy` removes everything |
+| Strict mode | Decrypts HTTPS and requires the TLS name and the Host header to match |
+
+## What's not covered
+
+Read these before relying on a sandbox:
+
+- **Web traffic to addresses in network mode, and to the addresses in both mode on non-web ports, is not checked by name.** Those connections go straight to the address, so the proxy never sees them.
+- **nmap can't scan web ports through the proxy.** In both mode, web ports on listed addresses are closed to raw traffic on purpose. Web testing uses the domains list.
+- **Other HTTP services bypass the check.** A web app on port 8080 or 8000 is not a web port in the rules, so it goes raw in network mode and in the non-web part of both mode. The rules can't see what protocol runs on a port.
+- **Shared-hosting addresses serve other sites.** A listed address on a CDN can serve sites you never approved, and raw traffic reaches them too.
+- **Pinned clients.** Trust and pinning are separate. Pinning means the client accepts only one specific certificate, even one from a trusted authority. Strict mode replaces the target's certificate, so a pinned client fails there. Default mode passes HTTPS through untouched, so pinned clients work. Direct-IP connections are always decrypted, so pinned clients can fail on those. There's no per-host exemption from strict mode yet.
+- **Trust follows the Mac.** `init` copies the trust roots from this Mac's keychains into the image. If your network inspects HTTPS, your company's root is included, so the sandbox trusts what your Mac trusts.
+- **Credentials.** Logins and API keys live inside the sandbox. An agent that reads them can send them to any reachable host. Use test accounts, and keep the lists tight.
+- **Port restrictions on the proxy.** The domain list matches hostnames, not ports.
+- **Anything inside an allowed host.** Allowed sites are reachable in full. Scope is still the operator's job.
+
 
 ## Troubleshooting
 
