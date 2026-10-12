@@ -5,6 +5,7 @@
 
 # AI providers
 .oaistatic.com
+oaistatic.com
 api.anthropic.com
 api.perplexity.ai
 api.workos.com
@@ -73,6 +74,7 @@ ziglang.org
 
 # Code hosting and containers
 .data.mcr.microsoft.com
+data.mcr.microsoft.com
 code.visualstudio.com
 k8s.io
 mcr.microsoft.com
@@ -81,7 +83,9 @@ vscode.download.prss.microsoft.com
 
 # Cloud and developer services (exact hosts and bounded domains only)
 .gstatic.com
+gstatic.com
 .gvt1.com
+gvt1.com
 .hashicorp.com
 apis.google.com
 app.daytona.io
@@ -119,14 +123,23 @@ ubuntu.com
 
 # Certificate validation (OCSP and CRL)
 .amazontrust.com
+amazontrust.com
 .lencr.org
+lencr.org
 .pki.goog
+pki.goog
 .pki.microsoft.com
+pki.microsoft.com
 .one.au.digicert.com
+one.au.digicert.com
 .one.ch.digicert.com
+one.ch.digicert.com
 .one.digicert.co.jp
+one.digicert.co.jp
 .one.digicert.com
+one.digicert.com
 .one.nl.digicert.com
+one.nl.digicert.com
 cacerts.digicert.com
 crl.digicert.com
 crl.comodoca.com

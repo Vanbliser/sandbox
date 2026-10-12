@@ -360,11 +360,81 @@ check_domain_file() {
   awk '!seen[$0]++' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
 }
 
+# True when host $1 is allowed by the domain list $2 (exact name, a .suffix entry, or all).
+host_listed() {
+  local h="$1" f="$2" d
+  grep -qx all "$f" && return 0
+  while IFS= read -r d; do
+    [[ "$h" == "$d" ]] && return 0
+    [[ "$d" == .* && "$h" == *"$d" ]] && return 0
+  done < "$f"
+  return 1
+}
+
+# Checks a pinned-host file against the allowed list $2. Writes the cleaned list to $3.
+# Pinned hosts skip the Host check under strict mode, so each one must already be allowed.
+check_pinned_file() {
+  local file="$1" allowed="$2" out="$3" h
+  check_domain_file "$file" "$out.raw"
+  : > "$out"
+  while IFS= read -r h; do
+    [[ "$h" == "all" ]] && die "pinned file $file: 'all' can't be pinned. List the hosts you need"
+    host_listed "$h" "$allowed" || die "pinned file $file: '$h' is not in the domain list. Pin only allowed hosts"
+    echo "$h" >> "$out"
+  done < "$out.raw"
+  rm -f "$out.raw"
+}
+
+# Upstream CA files may be PEM or DER (Burp exports DER). Squid needs PEM, so DER is converted on the way in.
+check_upstream_ca() {
+  if grep -q 'BEGIN CERTIFICATE' "$1"; then
+    openssl x509 -noout -in "$1" >/dev/null 2>&1 || die "upstream CA '$1' is not a valid PEM certificate"
+  else
+    openssl x509 -inform DER -noout -in "$1" >/dev/null 2>&1 || die "upstream CA '$1' is neither a PEM nor a DER certificate"
+  fi
+}
+
+store_upstream_ca() {
+  if grep -q 'BEGIN CERTIFICATE' "$1"; then
+    cp "$1" "$2"
+  else
+    openssl x509 -inform DER -in "$1" -out "$2"
+  fi
+}
+
+# Warns when an upstream proxy is set but nothing is listening on it yet.
+upstream_warning() {
+  local spec="$1"
+  if ! nc -z -w 2 "${spec%:*}" "${spec##*:}" 2>/dev/null; then
+    echo "warning: nothing is listening on the upstream proxy $spec. Web requests fail until it starts"
+  fi
+}
+
+# Explains a proxy failure when an upstream proxy is set. Prints nothing when no upstream is set.
+upstream_hint() {
+  local dir="$1" short="$2" spec
+  [[ -s "$dir/upstream" ]] || return 0
+  spec="$(cat "$dir/upstream")"
+  if nc -z -w 2 "${spec%:*}" "${spec##*:}" 2>/dev/null; then
+    echo "      the upstream proxy $spec is listening. If it is Burp, check that its CA is set (sandbox upstream $short $spec <ca.pem>) and that Intercept isn't holding requests"
+  else
+    echo "      the upstream proxy $spec is NOT listening, so web requests fail. Start the proxy's listener on that port (Burp: Proxy > Proxy listeners), or clear the upstream: sandbox upstream $short none"
+  fi
+}
+
+# Checks an upstream proxy spec (host:port) before anything is changed.
+check_upstream() {
+  local spec="$1" port
+  [[ "$spec" =~ ^[A-Za-z0-9._-]+:[0-9]{1,5}$ ]] || die "upstream must be host:port (got '$spec')"
+  port="${spec##*:}"
+  (( 10#$port >= 1 && 10#$port <= 65535 )) || die "upstream port out of range: $spec"
+}
+
 # ---------------------------------------------------------------- proxy and firewall
 
 write_squid_conf() {
   local name="$1" dir="$SB_BASE/$1"
-  local gateway policy certgen bump listed_acl="" d
+  local gateway policy certgen bump listed_acl="" pinned_acl="" d
   gateway="$(json_field "$dir/state.json" gateway)"
   policy="$(cat "$dir/policy")"
   certgen="$(find_certgen)"
@@ -380,11 +450,45 @@ write_squid_conf() {
     fi
   done < "$dir/domains.txt"
 
+  # A pinned host that is no longer in the domain list is skipped, not spliced.
+  if [[ -s "$dir/pinned.txt" ]]; then
+    while IFS= read -r d; do
+      [[ -z "$d" ]] && continue
+      host_listed "$d" "$dir/domains.txt" || continue
+      pinned_acl+="acl pinned_dst dstdomain $d"$'\n'
+    done < "$dir/pinned.txt"
+  fi
+
+  # Strict: pinned hosts are spliced (not decrypted) before the blanket bump, so they skip the Host check.
+  # Default: listed hosts are already spliced, so pinned hosts need no extra rule.
+  bump=""
   if [[ "$policy" == "strict" ]]; then
-    bump="ssl_bump bump all"
+    [[ -n "$pinned_acl" ]] && bump="ssl_bump splice pinned_dst"$'\n'
   else
-    bump="ssl_bump splice listed_dst
-ssl_bump bump all"
+    bump="ssl_bump splice listed_dst"$'\n'
+  fi
+  bump+="ssl_bump bump all"
+
+  # Upstream proxy (for example Burp): web traffic goes to it instead of straight out. Squid must
+  # trust that proxy's CA on the upstream leg, so the CA file goes to tls_outgoing_options.
+  local peer_block=""
+  if [[ -s "$dir/upstream" ]]; then
+    # Splicing would pass the upstream's certificate to the client, which doesn't trust it, so
+    # listed hosts are decrypted and the upstream sees them. The default address check can't work
+    # either, because Squid's server connection goes to the upstream, so the Host/SNI check is used.
+    # Pinned hosts don't skip inspection while an upstream is set.
+    policy="strict"
+    bump="ssl_bump bump all"
+    local up_spec up_host up_port
+    up_spec="$(cat "$dir/upstream")"
+    up_host="${up_spec%:*}"
+    up_port="${up_spec##*:}"
+    peer_block="cache_peer $up_host parent $up_port 0 no-query default proxy-only no-digest"$'\n'
+    peer_block+="never_direct allow all"$'\n'
+    peer_block+="always_direct deny all"$'\n'
+    if [[ -s "$dir/upstream-ca.pem" ]]; then
+      peer_block+="tls_outgoing_options cafile=$dir/upstream-ca.pem"$'\n'
+    fi
   fi
 
   cat > "$dir/squid.conf" <<EOF
@@ -399,9 +503,10 @@ http_port $gateway:$PROXY_PORT ssl-bump cert=$CA_DIR/ca.crt key=$CA_DIR/ca.key g
 sslcrtd_program $certgen -s $dir/ssl_db -M 4MB
 sslcrtd_children 2 startup=1
 sslproxy_session_cache_size 0
+$peer_block
 acl step1 at_step SslBump1
 acl step2 at_step SslBump2
-$listed_acl
+$listed_acl$pinned_acl
 ssl_bump peek step1
 $bump
 external_acl_type sbx_check ttl=0 children-max=4 %ssl::>sni %>h{Host} %<la $BIN_DIR/check-host.sh $policy $dir/domains.txt
@@ -510,9 +615,10 @@ stop_capture() {
 
 # One line per flow for this sandbox, built from pf's log records.
 network_flows() {
-  local name="$1" file="$SB_BASE/$1/pflog.txt"
+  local name="$1" file="$SB_BASE/$1/pflog.txt" gw
   [[ -s "$file" ]] || { echo "(no network records yet)"; return 0; }
-  awk -v tag="rule 0.sandbox-$name." '
+  gw="$(json_field "$SB_BASE/$1/state.json" gateway)"
+  awk -v tag="rule 0.sandbox-$name." -v gw="$gw" '
     index($0, tag) == 0 { next }
     {
       ts = $1
@@ -520,6 +626,7 @@ network_flows() {
       sub(/^[^)]*\): /, "", line)
       split(line, f, " ")
       action = f[1]; src = f[5]; dst = f[7]; sub(/:$/, "", dst)
+      if (gw != "" && index(src, gw ".") == 1) next
       proto = "other"
       if (f[8] ~ /^ICMP/) proto = "icmp"
       else if (f[8] == "UDP,") proto = "udp"
@@ -584,18 +691,21 @@ rollback_up() {
 cmd_up() {
   local short="${1:-}"
   shift || true
-  [[ -n "$short" ]] || die "usage: sandbox up <name> [-m web|network|both] [-d <domains-file>] [-i <ips-file>] [--strict] [--no-defaults]"
+  [[ -n "$short" ]] || die "usage: sandbox up <name> [-m web|network|both] [-d <domains-file>] [-i <ips-file>] [-p <pinned-file>] [--upstream <host:port> [--upstream-ca <pem>]] [--strict] [--no-defaults]"
   set_sandbox_names "$short"
   local name="$NAME" dir="$DIR"
 
-  local mode="" mode_given=0 domains="" ips_src="" use_defaults=1 defaults_given=0 strict=0
+  local mode="" mode_given=0 domains="" ips_src="" pin_src="" up_spec="" up_ca="" use_defaults=1 defaults_given=0 strict=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -m|--mode|-d|--domains|-i|--ips)
+      -m|--mode|-d|--domains|-i|--ips|-p|--pinned|--upstream|--upstream-ca)
         [[ $# -ge 2 ]] || die "$1 needs a value"
         case "$1" in
           -m|--mode) mode="$2"; mode_given=1 ;;
           -d|--domains) domains="$2" ;;
+          -p|--pinned) pin_src="$2" ;;
+          --upstream) up_spec="$2" ;;
+          --upstream-ca) up_ca="$2" ;;
           *) ips_src="$2" ;;
         esac
         shift
@@ -616,6 +726,9 @@ cmd_up() {
     if [[ $mode_given -eq 0 && -f "$dir/access-mode" ]]; then mode="$(cat "$dir/access-mode")"; fi
     if [[ -z "$domains" && -f "$dir/engagement.txt" ]]; then domains="$dir/engagement.txt"; fi
     if [[ -z "$ips_src" && -f "$dir/ips-source.txt" ]]; then ips_src="$dir/ips-source.txt"; fi
+    if [[ -z "$pin_src" && -f "$dir/pinned.txt" ]]; then pin_src="$dir/pinned.txt"; fi
+    if [[ -z "$up_spec" && -f "$dir/upstream" ]]; then up_spec="$(cat "$dir/upstream")"; fi
+    if [[ -z "$up_ca" && -f "$dir/upstream-ca.pem" ]]; then up_ca="$dir/upstream-ca.pem"; fi
     if [[ $defaults_given -eq 0 && -f "$dir/defaults" ]]; then use_defaults="$(cat "$dir/defaults")"; fi
     if [[ -f "$dir/policy" && "$(cat "$dir/policy")" == "strict" && $strict -eq 0 ]]; then strict=1; fi
   fi
@@ -630,16 +743,32 @@ cmd_up() {
   [[ "$mode" != "network" || $strict -eq 0 ]] || die "--strict applies to web traffic, and network mode has none"
   [[ -z "$domains" || -f "$domains" ]] || die "domain file not found: $domains"
   [[ -z "$ips_src" || -f "$ips_src" ]] || die "IP file not found: $ips_src"
+  [[ "$mode" != "network" || -z "$pin_src" ]] || die "network mode has no proxy, so it doesn't use a pinned-host file (-p). Use -m web or -m both"
+  [[ -z "$pin_src" || -f "$pin_src" ]] || die "pinned-host file not found: $pin_src"
+  [[ -z "$up_spec" || "$mode" != "network" ]] || die "network mode has no proxy, so it doesn't use an upstream proxy (--upstream). Use -m web or -m both"
+  [[ -z "$up_ca" || -n "$up_spec" ]] || die "--upstream-ca needs --upstream"
+  [[ -z "$up_spec" ]] || check_upstream "$up_spec"
+  if [[ -n "$up_ca" ]]; then
+    [[ -f "$up_ca" ]] || die "upstream CA file not found: $up_ca"
+    check_upstream_ca "$up_ca"
+  fi
   [[ -x "$BIN_DIR/check-host.sh" && -f "$CA_DIR/ca.crt" ]] || die "this Mac isn't set up yet. Run: sudo ./install.sh"
 
   # Check every list before anything is created. A failed check creates nothing.
-  local work
+  # work is global on purpose: the EXIT trap runs after this function's locals are gone.
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
   : > "$work/engagement"
   [[ -z "$domains" ]] || check_domain_file "$domains" "$work/engagement"
   : > "$work/ips.txt"
   [[ -z "$ips_src" ]] || normalize_ips "$ips_src" none "$work/ips.txt"
+  if [[ -n "$pin_src" ]]; then
+    {
+      [[ $use_defaults -eq 1 ]] && grep -vE '^[[:space:]]*(#|$)' "$DEFAULTS_FILE"
+      cat "$work/engagement"
+    } | awk '!seen[$0]++' > "$work/allowed"
+    check_pinned_file "$pin_src" "$work/allowed" "$work/pinned"
+  fi
 
   UP_NAME="$name" UP_DIR="$dir" UP_CONTAINER="sbx-$name" UP_NETWORK="sbx-$name" UP_WORK="$work" UP_EXISTED="$existed"
   trap rollback_up EXIT
@@ -680,6 +809,11 @@ cmd_up() {
       cat "$dir/engagement.txt"
     } | awk '!seen[$0]++' > "$dir/domains.txt"
     if [[ $strict -eq 1 ]]; then echo "strict" > "$dir/policy"; else echo "default" > "$dir/policy"; fi
+    if [[ -n "$pin_src" ]]; then cp "$work/pinned" "$dir/pinned.txt"; else rm -f "$dir/pinned.txt"; fi
+    if [[ -n "$up_spec" ]]; then echo "$up_spec" > "$dir/upstream"; else rm -f "$dir/upstream"; fi
+    if [[ -n "$up_ca" && "$up_ca" != "$dir/upstream-ca.pem" ]]; then store_upstream_ca "$up_ca" "$dir/upstream-ca.pem"
+    elif [[ -z "$up_ca" ]]; then rm -f "$dir/upstream-ca.pem"
+    fi
   fi
   if [[ "$mode" != "web" ]]; then
     if [[ -n "$ips_src" && "$ips_src" != "$dir/ips-source.txt" ]]; then
@@ -722,12 +856,50 @@ cmd_up() {
     echo "proxy on $gateway:$PROXY_PORT, policy: $(cat "$dir/policy")"
     [[ -s "$dir/engagement.txt" ]] || echo "note: no domains were given, so no web traffic is allowed. Load some with: sandbox domain $short <file>"
     grep -qx all "$dir/domains.txt" && echo "WARNING: 'all' is set for domains. The proxy allows every hostname."
+    if [[ -s "$dir/pinned.txt" ]]; then
+      echo "pinned:    $(grep -c . "$dir/pinned.txt") host(s). Under strict mode these skip the Host check"
+      [[ "$(cat "$dir/policy")" == "strict" ]] || echo "           pinned hosts only change behaviour under strict mode (--strict or: sandbox strict $short on)"
+    fi
+    if [[ -s "$dir/upstream" ]]; then
+      echo "upstream:  web goes via $(cat "$dir/upstream") $([[ -s "$dir/upstream-ca.pem" ]] && echo "(CA trusted)" || echo "(no CA: upstream certificates must be publicly trusted)")"
+      echo "           with an upstream, every listed host is decrypted and checked by Host/SNI (strict), and pinned hosts are inspected too"
+      upstream_warning "$(cat "$dir/upstream")"
+    fi
   fi
   if [[ "$mode" != "web" ]]; then
     [[ -s "$dir/ips.txt" ]] || echo "note: no addresses were given, so no raw traffic is allowed. Load some with: sandbox ip $short <file>"
     grep -qx "0.0.0.0/0" "$dir/ips.txt" && echo "$(ip_all_warning "$dir")"
   fi
   return 0
+}
+
+cmd_start() {
+  require_sandbox "${1:-}"
+  local dir="$DIR" name="$NAME" mode gateway bridge state
+  mode="$(cat "$dir/access-mode")"
+  gateway="$(json_field "$dir/state.json" gateway)"
+  bridge="$(json_field "$dir/state.json" bridge)"
+
+  state="$(container list --all 2>/dev/null | awk -v c="sbx-$name" '$1==c{print $5}')"
+  [[ -n "$state" ]] || die "the container for $1 is missing; run 'sandbox destroy $1' and 'sandbox up' again"
+  if [[ "$state" != "running" ]]; then
+    container start "sbx-$name" >/dev/null || die "could not start the container sbx-$name"
+  fi
+
+  # The sandbox's address plan must still match what was saved, or its rules would apply to the wrong place.
+  local now
+  now="$(container inspect "sbx-$name" | grep -o '"ipv4Gateway" : "[^"]*"' | head -1 | cut -d'"' -f4)"
+  [[ "$now" == "$gateway" ]] || die "the sandbox's gateway changed ($gateway -> ${now:-none}). Run 'sandbox destroy $1' and 'sandbox up' again"
+  [[ "$(find_bridge "$gateway")" == "$bridge" ]] || die "the sandbox's bridge changed. Run 'sandbox destroy $1' and 'sandbox up' again"
+
+  if [[ "$mode" != "network" ]]; then
+    reload_or_start_proxy "$name"
+  fi
+  load_pf_anchor "$name"
+  if [[ "$mode" != "web" ]]; then
+    start_capture "$name"
+  fi
+  echo "sandbox ${1} started (mode $mode). Check it with: sandbox verify ${1}"
 }
 
 cmd_strict() {
@@ -744,9 +916,57 @@ cmd_strict() {
   echo "sandbox ${1}: policy $policy"
 }
 
+cmd_pin() {
+  require_sandbox "${1:-}"
+  local dir="$DIR" name="$NAME" file="${2:-}"
+  # work is global so the EXIT trap can still see it
+  [[ "$(cat "$dir/access-mode")" != "network" ]] || die "network mode has no proxy, so it has no pinned hosts"
+  if [[ "$file" == "none" ]]; then
+    rm -f "$dir/pinned.txt"
+    reload_or_start_proxy "$name"
+    echo "sandbox ${1}: pinned hosts cleared and the proxy reloaded"
+    return 0
+  fi
+  [[ -f "$file" ]] || die "usage: sandbox pin <name> <pinned-file>|none"
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  check_pinned_file "$file" "$dir/domains.txt" "$work/pinned"
+  cp "$work/pinned" "$dir/pinned.txt"
+  reload_or_start_proxy "$name"
+  echo "sandbox ${1}: $(grep -c . "$dir/pinned.txt" || true) pinned host(s) loaded and the proxy reloaded"
+  [[ "$(cat "$dir/policy")" == "strict" ]] || echo "note: pinned hosts only change behaviour under strict mode (sandbox strict ${1} on)"
+  return 0
+}
+
+cmd_upstream() {
+  require_sandbox "${1:-}"
+  local dir="$DIR" name="$NAME" spec="${2:-}" ca="${3:-}"
+  [[ "$(cat "$dir/access-mode")" != "network" ]] || die "network mode has no proxy, so it has no upstream proxy"
+  if [[ "$spec" == "none" ]]; then
+    rm -f "$dir/upstream" "$dir/upstream-ca.pem"
+    reload_or_start_proxy "$name"
+    echo "sandbox ${1}: upstream proxy removed and the proxy reloaded"
+    return 0
+  fi
+  [[ -n "$spec" ]] || die "usage: sandbox upstream <name> <host:port>|none [<ca.pem>]"
+  check_upstream "$spec"
+  if [[ -n "$ca" ]]; then
+    [[ -f "$ca" ]] || die "upstream CA file not found: $ca"
+    check_upstream_ca "$ca"
+  fi
+  echo "$spec" > "$dir/upstream"
+  if [[ -n "$ca" ]]; then store_upstream_ca "$ca" "$dir/upstream-ca.pem"; else rm -f "$dir/upstream-ca.pem"; fi
+  reload_or_start_proxy "$name"
+  echo "sandbox ${1}: web goes via $spec and the proxy reloaded"
+  upstream_warning "$spec"
+  [[ -n "$ca" ]] || echo "note: no CA given. The upstream proxy's certificates must be publicly trusted, or web requests will fail"
+  return 0
+}
+
 cmd_domain() {
   require_sandbox "${1:-}"
-  local dir="$DIR" name="$NAME" file="${2:-}" work
+  local dir="$DIR" name="$NAME" file="${2:-}"
+  # work is global so the EXIT trap can still see it
   [[ "$(cat "$dir/access-mode")" != "network" ]] || die "network mode has no proxy, so it has no domain list"
   [[ -f "$file" ]] || die "usage: sandbox domain <name> <domains-file>"
   work="$(mktemp -d)"
@@ -757,6 +977,18 @@ cmd_domain() {
     [[ "$(cat "$dir/defaults" 2>/dev/null || echo 1)" == "1" ]] && grep -vE '^[[:space:]]*(#|$)' "$DEFAULTS_FILE"
     cat "$dir/engagement.txt"
   } | awk '!seen[$0]++' > "$dir/domains.txt"
+  if [[ -s "$dir/pinned.txt" ]]; then
+    local h
+    : > "$work/pinned.kept"
+    while IFS= read -r h; do
+      if host_listed "$h" "$dir/domains.txt"; then
+        echo "$h" >> "$work/pinned.kept"
+      else
+        echo "pinned host $h is no longer in the domain list, so it was removed from the pinned list"
+      fi
+    done < "$dir/pinned.txt"
+    cp "$work/pinned.kept" "$dir/pinned.txt"
+  fi
   reload_or_start_proxy "$name"
   echo "sandbox ${1}: $(grep -c . "$dir/domains.txt" || true) domain(s) loaded and the proxy reloaded"
   grep -qx all "$dir/domains.txt" && echo "WARNING: 'all' is set for domains. The proxy allows every hostname."
@@ -789,6 +1021,8 @@ cmd_status() {
   if [[ -f "$dir/policy" ]]; then
     if [[ -n "$proxy" ]]; then echo "proxy:     running (pid $proxy), policy $(cat "$dir/policy")"; else echo "proxy:     stopped"; fi
     echo "domains:   $(grep -cvE '^(#|$)' "$dir/domains.txt") allowed"
+    if [[ -s "$dir/pinned.txt" ]]; then echo "pinned:    $(grep -c . "$dir/pinned.txt") host(s) skip the Host check under strict"; fi
+    if [[ -s "$dir/upstream" ]]; then echo "upstream:  $(cat "$dir/upstream")$([[ -s "$dir/upstream-ca.pem" ]] && echo " (CA trusted)")"; fi
   else
     echo "proxy:     not used in this mode"
   fi
@@ -863,10 +1097,16 @@ cmd_verify() {
 
   if [[ "$mode" != "network" ]]; then
     local allowed_host
-    allowed_host="$(grep -vE '^(#|$|all$)' "$dir/domains.txt" 2>/dev/null | head -1 | sed 's/^\.//')"
+    # Prefer a plain host. A .suffix entry only covers subdomains, so test a www. name under it.
+    allowed_host="$(grep -vE '^(#|$|all$|\.)' "$dir/domains.txt" 2>/dev/null | head -1)"
+    [[ -n "$allowed_host" ]] || allowed_host="$(grep -E '^\.' "$dir/domains.txt" 2>/dev/null | head -1 | sed 's/^\./www./')"
     if [[ -n "$allowed_host" ]]; then
-      code="$(container exec "$container" sh -c "curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT https://$allowed_host/ | grep -i '^x-squid-error' || echo allowed" 2>/dev/null || true)"
-      check "proxy allows a listed host ($allowed_host)" "$([[ "$code" == *allowed* ]] && echo yes || echo no)"
+      # A failed request (curl exit != 0, e.g. a dead upstream) counts as not allowed.
+      code="$(container exec "$container" sh -c "h=\$(curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT https://$allowed_host/) || { echo curl-failed; exit 0; }; printf '%s\n' \"\$h\" | grep -i '^x-squid-error' || echo allowed" 2>/dev/null || true)"
+      local allowed_ok
+      allowed_ok="$([[ "$code" == *allowed* ]] && echo yes || echo no)"
+      check "proxy allows a listed host ($allowed_host)" "$allowed_ok"
+      [[ "$allowed_ok" == "yes" ]] || upstream_hint "$dir" "${1}"
     else
       echo "SKIP  proxy allows a listed host (no domains are listed)"
     fi
@@ -970,7 +1210,7 @@ cmd_shell() {
   local container="sbx-$NAME" state
   state="$(container list --all 2>/dev/null | awk -v c="$container" '$1==c{print $5}')"
   [[ -n "$state" ]] || die "the container for $1 is missing; run 'sandbox destroy $1' and 'sandbox up' again"
-  [[ "$state" == "running" ]] || die "$1 is $state; its container is stopped. (There is no start command yet; recreate it with 'sandbox destroy $1' and 'sandbox up')"
+  [[ "$state" == "running" ]] || die "$1 is $state; its container is stopped. Start it with: sandbox start $1"
   container exec -it "$container" sh
 }
 
@@ -985,10 +1225,11 @@ Once per project folder:
   init                                        make this folder a sandbox project
 
 Inside a project (the project is found from the current folder):
-  up <name> [-m web|network|both] [-d <file>] [-i <file>] [--strict] [--no-defaults]
+  up <name> [-m web|network|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port> [--upstream-ca <pem>]] [--strict] [--no-defaults]
         -m   mode, default both
         -d   domain file (web and both). Optional: an empty list is created if it's missing
         -i   IP file (network and both). Optional: an empty list is created if it's missing
+        -p   pinned-host file (web and both). Hosts must also be in the domain list
         --strict, --no-defaults   web and both only
   domain <name> <file>                        replace the domain list and reload the proxy (web and both)
   ip <name> <file>                            replace the IP list and reload the firewall (network and both)
@@ -996,8 +1237,11 @@ Inside a project (the project is found from the current folder):
   verify <name>                               run the containment checks (PASS/FAIL)
   shell <name>                                open a shell inside the sandbox
   strict <name> on|off                        strict Host/SNI checking (web and both)
+  pin <name> <file>|none                      hosts that skip the Host check under strict (web and both)
+  upstream <name> <host:port>|none [<ca.pem>] send web through another proxy, such as Burp (web and both)
   logs <name> [-f]                            web decisions (proxy) and network decisions (pf)
   down <name>                                 stop the container, proxy and rules (keeps state)
+  start <name>                                bring a stopped sandbox back up with its saved settings
   destroy <name>                              remove everything and archive logs and settings
 
 Anywhere:
@@ -1023,10 +1267,13 @@ case "${1:-}" in
   domain) ensure_container_service; resolve_project; cmd_domain "${2:-}" "${3:-}" ;;
   ip) ensure_container_service; resolve_project; cmd_ip "${2:-}" "${3:-}" ;;
   strict) ensure_container_service; resolve_project; cmd_strict "${2:-}" "${3:-}" ;;
+  pin) ensure_container_service; resolve_project; cmd_pin "${2:-}" "${3:-}" ;;
+  upstream) ensure_container_service; resolve_project; cmd_upstream "${2:-}" "${3:-}" "${4:-}" ;;
   verify) ensure_container_service; resolve_project; cmd_verify "${2:-}" ;;
   status) ensure_container_service; resolve_project; cmd_status "${2:-}" ;;
   logs) resolve_project; cmd_logs "${2:-}" "${3:-}" ;;
   down) ensure_container_service; resolve_project; cmd_down "${2:-}" ;;
+  start) ensure_container_service; resolve_project; cmd_start "${2:-}" ;;
   destroy) ensure_container_service; resolve_project; cmd_destroy "${2:-}" ;;
   shell) ensure_container_service; resolve_project; cmd_shell "${2:-}" ;;
   ""|-h|--help|help) usage ;;
