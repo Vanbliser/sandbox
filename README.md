@@ -238,7 +238,7 @@ Changes apply to new connections.
 
 Written for: operators who use the sandbox tool and will read this in the README.
 
-## Pinned hosts (`pin` and `up -p`)
+## Pinned hosts
 
 Some clients pin their certificates, so strict mode breaks them. Strict mode decrypts web traffic and checks that the SNI matches the Host header. A pinned client rejects the decrypted connection, so the request fails. Pinned hosts are the exception: Squid passes their traffic through without decrypting it, so the client's certificate check still works.
 
@@ -252,9 +252,9 @@ sandbox pin <name> <file>
 sandbox pin <name> none
 ```
 
-- `up -p <file>` sets the pinned list when the sandbox is created.
-- `pin <name> <file>` replaces the list on a running sandbox and reloads the proxy.
-- `pin <name> none` clears the list.
+- `sandbox up -p <file>` sets the pinned list when the sandbox is created.
+- `sandbox pin <name> <file>` replaces the list on a running sandbox and reloads the proxy.
+- `sandbox pin <name> none` clears the list.
 
 **Rules:**
 - Each pinned host must already be in the domain list. A host that isn't allowed is refused, and nothing changes.
@@ -384,8 +384,8 @@ Read these before relying on a sandbox:
 - **Web ports on raw addresses bypass the proxy when both lists are `all`.** Tools can then reach any web server directly, with no domain check.
 - **Other HTTP services bypass the check.** A web app on port 8080 or 8000 isn't a web port in the rules, so it goes raw.
 - **Shared-hosting addresses serve other sites.** A listed address on a CDN can serve sites you never approved, and raw traffic reaches them too.
-- **Pinned clients.** Trust and pinning are separate. A client that pins a certificate fails under strict mode, because strict mode replaces the target's certificate. Default mode passes HTTPS through untouched, so pinned clients work there. Direct-IP connections are always decrypted, so pinned clients can fail on those. There's no per-host exemption from strict mode yet.
-- **Trust follows the Mac.** `setup` copies the trust roots from this Mac's keychains into the image. If your network inspects HTTPS, your company's root is included.
+- **Pinned clients.** Trust and pinning are separate. Direct-IP connections are always decrypted, so pinned clients can fail on those.
+- **Trust follows the Mac.** `setup` copies the trust roots from your Mac's keychains into the sandbox's image.
 - **Credentials.** Logins and API keys live inside the sandbox. An agent that reads them can send them to any reachable host. Use test accounts, and keep the lists tight.
 - **Port restrictions on the proxy.** The domain list matches hostnames, not ports.
 - **Anything inside an allowed host.** Allowed sites are reachable in full. Scope is still the operator's job.
@@ -409,11 +409,3 @@ The tool is one Bash script, `sandbox`, with a privileged helper, `privileged/sa
 - Check syntax after every change: `bash -n sandbox && bash -n privileged/sandbox-pf && bash -n install.sh`
 - Test each change end to end: `up`, `verify`, the traffic checks, then `destroy`. There are no automated tests yet.
 - After changing the helper, reinstall it with `sudo ./install.sh`.
-
-Open items:
-- A `start` command, to bring a stopped sandbox back up
-- A way to exempt a pinned host from strict mode
-- Filtering the host's own multicast from the network log
-- Port restrictions on the proxy
-- Burp as an optional upstream proxy
-- Automated tests
