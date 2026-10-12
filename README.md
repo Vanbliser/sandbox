@@ -172,29 +172,6 @@ sandbox destroy app1    # removes the sandbox and archives its logs and settings
 sandbox list            # every sandbox in every project, with its project name
 ```
 
-## Commands
-
-| Command | What it does |
-|---|---|
-| `sandbox setup` | Once per Mac: create the CA and build the image. The installer runs it for you |
-| `sandbox init` | In a folder: make it a sandbox project |
-| `sandbox up <name> [-m web\|network\|both] [-d <file>] [-i <file>] [-p <filed] [--strict] [--upstream <ip:port>] [--upstream-ca <path_to_DER_CA>][--no-defaults]` | Create a sandbox. Mode defaults to `both`. Missing lists are created empty |
-| `sandbox domain <name> <file>` | Replace the domain list and reload the proxy (web and both) |
-| `sandbox ip <name> <file>` | Replace the IP list and reload the firewall (network and both) |
-| `sandbox pin <name> <file>\|none` | Replace the pinned list on a running sandbox and reloads the proxy. `none` clears the list. |
-| `sandbox status <name>` | Show mode, container, proxy, rules and policy |
-| `sandbox verify <name>` | Run the containment checks, an upstream proxy check (e.g Burpsuite), PASS or FAIL for each |
-| `sandbox shell <name>` | Open a shell inside the sandbox |
-| `sandbox strict <name> on\|off` | Switch strict Host/SNI checking (web and both) |
-| `sandbox logs <name> [-f]` | Web decisions (proxy) and network decisions (pf), or follow them live |
-| `sandbox down <name>` | Stop the container, proxy and rules. Keeps the state |
-| `sandbox upstream <name> [<upstream_ip:port> <DER_ca_file> \| none]` | Sends web traffic to an upstream proxy, such as Burp. `none` unsets it |
-| `sandbox start <name>` | brings back a sandbox that sandbox down has stopped. reusing the kept state |
-| `sandbox destroy <name>` | Remove the sandbox. Archives its logs and settings in the project's `.sandbox/archive/` |
-| `sandbox list` | List every sandbox in every project on this Mac |
-
-Sandbox names are lowercase letters, digits and hyphens. The project name and the sandbox name together must be 50 characters or fewer.
-
 ## Input files
 
 **Domains file** (web and both): one hostname per line. A leading dot covers the domain and all its subdomains. `all` allows every hostname. Lines starting with `#` are ignored. An IP address in this file is refused, with a message that points you to the IP file.
@@ -332,6 +309,58 @@ sandbox: pinned file bad-pinned.txt: 'evil.example.io' is not in the domain list
 9. Prints the mode note and any warnings.
 
 If any step fails, the rollback stops Squid and the network log, flushes the pf rules, removes the container and network, and moves the sandbox's folder to the project's `.sandbox/failed/` (or keeps the lists, if they came from a clone).
+
+
+This is the expected behavior, not a new bug. The anchor flush runs through `sudo`, and the sudoers file only grants NOPASSWD for load, show, and capture. Flush needs your password, and `destroy` runs it without a prompt. The flush failure is suppressed, but `destroy` then reports it, which is what happened. I can't enter your password, so the leftover rules are still in the anchor.
+
+Here is the cleanup for you to run:
+
+```
+sudo /usr/local/libexec/sandbox-pf flush monnify-upt
+```
+
+The next `up` with that name replaces the anchor's rules, so the leftover can't affect a new sandbox.
+
+## Upstream proxy:
+
+**What it does:** When set, Squid sends web traffic to an upstream proxy, such as Burp, rather than straight out. Raw IP traffic is unaffected.
+
+**Commands**
+```
+sandbox up <name> -d domains.txt --upstream 127.0.0.1:8080 --upstream-ca ~/Downloads/cacert.der
+sandbox upstream <name> 127.0.0.1:8080 ~/Downloads/cacert.der
+sandbox upstream <name> none
+```
+
+Squid needs PEM, so it is concerted to PEM when it stores the file.
+
+- `--upstream-ca` adds Burp's CA to the trust list for the upstream leg. Without it, the upstream's certificates must be publicly trusted.
+- `status` shows the upstream and whether a CA is trusted. `up` and `upstream` print the same.
+- Upstream settings are committed with the project,.
+
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `sandbox setup` | Once per Mac: create the CA and build the image. The installer runs it for you |
+| `sandbox init` | In a folder: make it a sandbox project |
+| `sandbox up <name> [-m web\|network\|both] [-d <file>] [-i <file>] [-p <filed] [--strict] [--upstream <ip:port>] [--upstream-ca <path_to_DER_CA>][--no-defaults]` | Create a sandbox. Mode defaults to `both`. Missing lists are created empty |
+| `sandbox domain <name> <file>` | Replace the domain list and reload the proxy (web and both) |
+| `sandbox ip <name> <file>` | Replace the IP list and reload the firewall (network and both) |
+| `sandbox pin <name> <file>\|none` | Replace the pinned list on a running sandbox and reloads the proxy. `none` clears the list. |
+| `sandbox status <name>` | Show mode, container, proxy, rules and policy |
+| `sandbox verify <name>` | Run the containment checks, an upstream proxy check (e.g Burpsuite), PASS or FAIL for each |
+| `sandbox shell <name>` | Open a shell inside the sandbox |
+| `sandbox strict <name> on\|off` | Switch strict Host/SNI checking (web and both) |
+| `sandbox logs <name> [-f]` | Web decisions (proxy) and network decisions (pf), or follow them live |
+| `sandbox down <name>` | Stop the container, proxy and rules. Keeps the state |
+| `sandbox upstream <name> [<upstream_ip:port> <DER_ca_file> \| none]` | Sends web traffic to an upstream proxy, such as Burp. `none` unsets it |
+| `sandbox start <name>` | brings back a sandbox that sandbox down has stopped. reusing the kept state |
+| `sandbox destroy <name>` | Remove the sandbox. Archives its logs and settings in the project's `.sandbox/archive/` |
+| `sandbox list` | List every sandbox in every project on this Mac |
+
+Sandbox names are lowercase letters, digits and hyphens. The project name and the sandbox name together must be 50 characters or fewer.
 
 
 ## What's enforced
