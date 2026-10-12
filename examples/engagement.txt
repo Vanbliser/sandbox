@@ -1,0 +1,8 @@
+# Engagement allowlist. Copy this file, then edit it for each engagement.
+# One host per line. A leading dot covers the domain and its subdomains.
+# Lines starting with # are ignored.
+# Defaults (package registries, AI APIs, OS mirrors) are added automatically.
+
+# Target application
+app.example.com
+.app.example.com

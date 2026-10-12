@@ -1,0 +1,8 @@
+# Per-machine secrets and state. Never commit these.
+*.key
+ca/
+.sandbox/
+*.log
+*.out
+*.pid
+ssl_db/

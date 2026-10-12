@@ -1,0 +1,6 @@
+# Address list for network and both modes. One entry per line:
+#   a single address     203.0.113.10
+#   a range              203.0.113.20-203.0.113.40
+#   a CIDR block         198.51.100.0/24
+# Lines starting with # are ignored. Only list addresses that belong to the target.
+203.0.113.10

@@ -1,0 +1,804 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SANDBOX_HOME="${SANDBOX_HOME:-$HOME/.sandbox}"
+CA_DIR="$SANDBOX_HOME/ca"
+BIN_DIR="$SANDBOX_HOME/bin"
+PROXY_PORT=3128
+SANDBOX_IMAGE="${SANDBOX_IMAGE:-sandbox-base:latest}"
+PF_HELPER=/usr/local/libexec/sandbox-pf
+
+resolve_script_dir() {
+  local p="$1" d
+  while [[ -L "$p" ]]; do
+    d="$(cd "$(dirname "$p")" && pwd)"
+    p="$(readlink "$p")"
+    [[ "$p" == /* ]] || p="$d/$p"
+  done
+  cd "$(dirname "$p")" && pwd
+}
+SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
+DEFAULTS_FILE="$SCRIPT_DIR/defaults.txt"
+
+die() { echo "sandbox: $*" >&2; exit 1; }
+
+ensure_brew_pkg() {
+  local bin="$1" pkg="$2"
+  command -v "$bin" >/dev/null 2>&1 && return 0
+  command -v brew >/dev/null 2>&1 \
+    || die "missing '$bin' and Homebrew is not installed; install Homebrew from https://brew.sh then rerun"
+  read -r -p "'$bin' is missing. Install '$pkg' with Homebrew now? [y/N] " answer
+  [[ "$answer" =~ ^[Yy]$ ]] || die "'$bin' is required; install it and rerun"
+  brew install "$pkg" || die "brew install $pkg failed"
+  command -v "$bin" >/dev/null 2>&1 || die "'$bin' still not found after install"
+}
+
+write_helper() {
+  mkdir -p "$BIN_DIR"
+  cat > "$BIN_DIR/check-host.sh" <<'EOF'
+#!/usr/bin/env bash
+# Squid external ACL helper.
+# Input per request: "<sni> <host> <dest_ip>", with "-" for empty fields.
+# Args: <policy: default|strict> <domains file>
+set -u
+mode="$1"
+domains="$2"
+
+norm() {
+  local v="$1"
+  v="${v%%:*}"
+  v="${v%.}"
+  printf '%s' "$v" | tr 'A-Z' 'a-z'
+}
+
+listed() {
+  local h="$1" d
+  while IFS= read -r d; do
+    d="${d%%#*}"
+    d="$(printf '%s' "$d" | tr -d '[:space:]')"
+    [[ -z "$d" ]] && continue
+    d="$(norm "$d")"
+    [[ "$h" == "$d" ]] && return 0
+    [[ "$d" == .* && "$h" == *"$d" ]] && return 0
+  done < "$domains"
+  return 1
+}
+
+while read -r sni host dest; do
+  sni="$(norm "${sni:--}")"
+  host="$(norm "${host:--}")"
+  dest="${dest:--}"
+  [[ "$sni" == "-" ]] && sni=""
+  if [[ -z "$host" || "$host" == "-" ]]; then
+    echo "ERR message=no-host-header"; continue
+  fi
+  if ! listed "$host"; then
+    echo "ERR message=host-not-in-domains"; continue
+  fi
+  if [[ "$mode" == "strict" ]]; then
+    if [[ "$sni" != "$host" ]]; then
+      echo "ERR message=sni-host-mismatch"; continue
+    fi
+    echo "OK"; continue
+  fi
+  if [[ -n "$sni" ]]; then
+    echo "ERR message=sni-not-listed"; continue
+  fi
+  addrs="$( { dig +short A "$host"; dig +short AAAA "$host"; } 2>/dev/null || true )"
+  if [[ "$dest" != "-" ]] && grep -qxF "$dest" <<<"$addrs"; then
+    echo "OK"
+  else
+    echo "ERR message=dest-not-address-of-host"
+  fi
+done
+EOF
+  chmod 755 "$BIN_DIR/check-host.sh"
+}
+
+export_trusted_roots() {
+  local ctx="$1" out="$1/trusted-roots" pem
+  pem="$(mktemp)"
+  rm -rf "$out"
+  mkdir -p "$out"
+  local kc
+  for kc in /System/Library/Keychains/SystemRootCertificates.keychain \
+            /Library/Keychains/System.keychain \
+            "$HOME/Library/Keychains/login.keychain-db"; do
+    [[ -f "$kc" ]] && security find-certificate -a -p "$kc" >> "$pem" 2>/dev/null || true
+  done
+  awk -v dir="$out" '
+    /BEGIN CERTIFICATE/ { n++; f = sprintf("%s/root-%04d.crt", dir, n) }
+    f { print > f }
+    /END CERTIFICATE/ { close(f); f = "" }
+  ' "$pem"
+  rm -f "$pem"
+  cp "$CA_DIR/ca.crt" "$out/sandbox-ca.crt"
+  echo "exported $(ls "$out" | wc -l | tr -d ' ') trusted roots from this Mac"
+}
+
+build_image() {
+  local ctx="$SANDBOX_HOME/image"
+  mkdir -p "$ctx"
+  export_trusted_roots "$ctx"
+  cat > "$ctx/Containerfile" <<'EOF'
+FROM alpine:3.20
+RUN apk add --no-cache curl ca-certificates nodejs npm nmap
+COPY trusted-roots/ /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+EOF
+  echo "building image $SANDBOX_IMAGE (this takes a few minutes the first time)"
+  container build -t "$SANDBOX_IMAGE" -f "$ctx/Containerfile" "$ctx" >"$ctx/build.log" 2>&1 \
+    || die "image build failed; see $ctx/build.log"
+  echo "image ready: $SANDBOX_IMAGE"
+}
+
+cmd_init() {
+  [[ -x "$PF_HELPER" ]] || die "the privileged helper is not installed. Run: sudo ./install.sh"
+  command -v container >/dev/null 2>&1 \
+    || die "Apple 'container' CLI not found. Install it from https://github.com/apple/container/releases, then rerun"
+  command -v pfctl >/dev/null 2>&1 || die "pfctl not found; this tool needs macOS"
+  command -v openssl >/dev/null 2>&1 || die "openssl not found; it ships with macOS"
+  command -v dig >/dev/null 2>&1 || die "dig not found; it ships with macOS"
+  command -v python3 >/dev/null 2>&1 || die "python3 not found; install the Xcode Command Line Tools (xcode-select --install)"
+
+  ensure_brew_pkg squid squid
+
+  mkdir -p "$CA_DIR"
+  chmod 700 "$SANDBOX_HOME" "$CA_DIR"
+
+  if [[ -f "$CA_DIR/ca.key" && -f "$CA_DIR/ca.crt" ]]; then
+    echo "CA already exists: $CA_DIR/ca.crt"
+  else
+    openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout "$CA_DIR/ca.key" -out "$CA_DIR/ca.crt" \
+      -days 825 -subj "/CN=sandbox-local-ca-$(scutil --get LocalHostName 2>/dev/null || hostname -s)" \
+      >/dev/null 2>&1
+    chmod 600 "$CA_DIR/ca.key"
+    chmod 644 "$CA_DIR/ca.crt"
+    echo "created CA: $CA_DIR/ca.crt (private key: $CA_DIR/ca.key, owner-only)"
+  fi
+
+  write_helper
+  build_image
+  echo "ok: dependencies present, CA, helper and image ready"
+}
+
+candidate_subnets() {
+  local used n
+  used="$( {
+    ifconfig 2>/dev/null | awk '/inet /{print $2}'
+    netstat -rn -f inet 2>/dev/null | awk '{print $1}'
+    container network list 2>/dev/null | awk 'NR>1{print $2}'
+  } )"
+  for n in $(seq 200 250); do
+    if echo "$used" | grep -qE "^192\.168\.${n}[./]"; then
+      continue
+    fi
+    echo "192.168.${n}.0/24"
+  done
+}
+
+# Outbound test run before any pf rules exist: if this fails, the range isn't usable.
+probe_network() {
+  container run --rm --network "$1" "$SANDBOX_IMAGE" \
+    sh -c 'nc -z -w 5 1.1.1.1 443 || nc -z -w 5 8.8.8.8 443' >/dev/null 2>&1
+}
+
+find_bridge() {
+  local ip="$1"
+  ifconfig | awk -v ip="$ip" '
+    /^bridge[0-9]+:/ { iface = $1; sub(":", "", iface) }
+    $1 == "inet" && $2 == ip { print iface; found = 1; exit }
+    END { exit !found }
+  ' || die "no bridge interface carries gateway $ip"
+}
+
+json_field() {
+  grep -o "\"$2\": \"[^\"]*\"" "$1" | head -1 | cut -d'"' -f4
+}
+
+find_certgen() {
+  local p
+  p="$(find -L "$(brew --prefix squid)" \( -name security_file_certgen -o -name cert_generator \) -type f 2>/dev/null | head -1)"
+  [[ -n "$p" ]] || die "certificate helper (security_file_certgen) not found in the squid install"
+  echo "$p"
+}
+
+write_squid_conf() {
+  local name="$1" dir="$SANDBOX_HOME/$1"
+  local gateway policy certgen bump listed_acl="" d
+  gateway="$(json_field "$dir/state.json" gateway)"
+  policy="$(cat "$dir/policy")"
+  certgen="$(find_certgen)"
+
+  while IFS= read -r d; do
+    d="${d%%#*}"
+    d="$(printf '%s' "$d" | tr -d '[:space:]')"
+    [[ -z "$d" ]] && continue
+    listed_acl+="acl listed_dst dstdomain $d"$'\n'
+  done < "$dir/domains.txt"
+
+  if [[ "$policy" == "strict" ]]; then
+    bump="ssl_bump bump all"
+  else
+    bump="ssl_bump splice listed_dst
+ssl_bump bump all"
+  fi
+
+  cat > "$dir/squid.conf" <<EOF
+pid_filename $dir/squid.pid
+cache_log $dir/cache.log
+access_log $dir/access.log
+coredump_dir $dir
+cache deny all
+via off
+forwarded_for delete
+http_port $gateway:$PROXY_PORT ssl-bump cert=$CA_DIR/ca.crt key=$CA_DIR/ca.key generate-host-certificates=on dynamic_cert_mem_cache_size=4MB
+sslcrtd_program $certgen -s $dir/ssl_db -M 4MB
+sslcrtd_children 2 startup=1
+sslproxy_session_cache_size 0
+acl step1 at_step SslBump1
+acl step2 at_step SslBump2
+$listed_acl
+ssl_bump peek step1
+$bump
+external_acl_type sbx_check ttl=0 children-max=4 %ssl::>sni %>h{Host} %<la $BIN_DIR/check-host.sh $policy $dir/domains.txt
+acl ipdst dstdom_regex ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$
+http_access allow CONNECT listed_dst
+http_access allow CONNECT ipdst
+http_access deny CONNECT
+acl sbx_ok external sbx_check
+http_access allow sbx_ok
+http_access deny all
+EOF
+}
+
+reload_or_start_proxy() {
+  local name="$1" dir="$SANDBOX_HOME/$1"
+  write_squid_conf "$name"
+  squid -k parse -f "$dir/squid.conf" >"$dir/parse.log" 2>&1 \
+    || die "squid config invalid; see $dir/parse.log"
+
+  if [[ -n "$(proxy_pids "$name")" ]]; then
+    squid -k reconfigure -f "$dir/squid.conf" >>"$dir/parse.log" 2>&1 \
+      || die "squid reconfigure failed; see $dir/parse.log"
+    return 0
+  fi
+
+  local gateway
+  gateway="$(json_field "$dir/state.json" gateway)"
+  if nc -z "$gateway" "$PROXY_PORT" 2>/dev/null; then
+    die "$gateway:$PROXY_PORT is already in use by another process (see: lsof -nP -iTCP:$PROXY_PORT -sTCP:LISTEN)"
+  fi
+
+  if [[ ! -f "$dir/ssl_db/index.txt" ]]; then
+    "$(find_certgen)" -c -s "$dir/ssl_db" -M 4MB >>"$dir/parse.log" 2>&1 \
+      || die "could not create the certificate cache; see $dir/parse.log"
+  fi
+
+  squid -N -f "$dir/squid.conf" >"$dir/squid.out" 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if nc -z "$gateway" "$PROXY_PORT" 2>/dev/null && [[ -n "$(proxy_pids "$name")" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "--- squid.out ---" >&2
+  tail -n 15 "$dir/squid.out" >&2 2>/dev/null || true
+  echo "--- cache.log ---" >&2
+  tail -n 15 "$dir/cache.log" >&2 2>/dev/null || true
+  die "proxy did not start on $gateway:$PROXY_PORT"
+}
+
+# Turns an address file (single addresses, a-b ranges, CIDR, # comments) into CIDR
+# blocks. Refuses anything malformed, too broad, overlapping the sandbox subnet,
+# or containing this Mac's own addresses.
+normalize_ips() {
+  local src="$1" subnet="$2" out="$3" own
+  own="$(ifconfig | awk '$1=="inet"{print $2}' | paste -sd, -)"
+  python3 - "$src" "$subnet" "$own" > "$out" <<'PY' || die "the IP list has an invalid entry (see the message above)"
+import ipaddress, sys
+src, subnet, own_list = sys.argv[1], sys.argv[2], sys.argv[3]
+box = ipaddress.IPv4Network(subnet)
+own = [ipaddress.IPv4Address(x) for x in own_list.split(",") if x]
+for raw in open(src):
+    line = raw.split("#", 1)[0].replace(" ", "").replace("\t", "").strip()
+    if not line:
+        continue
+    try:
+        if "-" in line:
+            a, b = line.split("-", 1)
+            nets = list(ipaddress.summarize_address_range(ipaddress.IPv4Address(a), ipaddress.IPv4Address(b)))
+        else:
+            nets = [ipaddress.IPv4Network(line, strict=False)]
+    except ValueError:
+        print(f"sandbox: invalid IP entry: {line}", file=sys.stderr)
+        sys.exit(2)
+    for n in nets:
+        if n.prefixlen < 8:
+            print(f"sandbox: {n} is too broad (prefix below /8)", file=sys.stderr)
+            sys.exit(2)
+        if n.overlaps(box):
+            print(f"sandbox: {n} overlaps the sandbox subnet", file=sys.stderr)
+            sys.exit(2)
+        for o in own:
+            if o in n:
+                print(f"sandbox: {n} contains this Mac's address {o}", file=sys.stderr)
+                sys.exit(2)
+        print(n)
+PY
+}
+
+load_pf_anchor() {
+  local name="$1" dir="$SANDBOX_HOME/$1"
+  local subnet gateway bridge mode cidr cidrs=()
+  subnet="$(json_field "$dir/state.json" subnet)"
+  gateway="$(json_field "$dir/state.json" gateway)"
+  bridge="$(json_field "$dir/state.json" bridge)"
+  mode="$(cat "$dir/access-mode")"
+  [[ -x "$PF_HELPER" ]] || die "privileged helper missing; run: sudo ./install.sh"
+  if [[ "$mode" != "web" ]]; then
+    while IFS= read -r cidr; do
+      [[ -n "$cidr" ]] && cidrs+=("$cidr")
+    done < "$dir/ips.txt"
+  fi
+  sudo -n "$PF_HELPER" load "$name" "$subnet" "$gateway" "$bridge" "$PROXY_PORT" "$mode" \
+    ${cidrs[@]+"${cidrs[@]}"} >"$dir/pf.out" 2>&1 \
+    || die "could not load pf rules for $name (see $dir/pf.out)"
+  echo "pf rules loaded for $name ($mode mode)"
+}
+
+pf_show() {
+  sudo -n "$PF_HELPER" show "$1" 2>/dev/null || true
+}
+
+start_capture() {
+  sudo -n "$PF_HELPER" capture-start "$1" "$SANDBOX_HOME/$1/pflog.txt" \
+    || die "could not start the network log for $1"
+}
+
+stop_capture() {
+  sudo -n "$PF_HELPER" capture-stop "$1" >/dev/null 2>&1 || true
+}
+
+# One line per flow for this sandbox, built from pf's log records.
+network_flows() {
+  local name="$1" file="$SANDBOX_HOME/$1/pflog.txt"
+  [[ -s "$file" ]] || { echo "(no network records yet)"; return 0; }
+  awk -v tag="rule 0.sandbox-$name." '
+    index($0, tag) == 0 { next }
+    {
+      ts = $1
+      line = $0
+      sub(/^[^)]*\): /, "", line)
+      split(line, f, " ")
+      action = f[1]; src = f[5]; dst = f[7]; sub(/:$/, "", dst)
+      proto = "other"
+      if (f[8] ~ /^ICMP/) proto = "icmp"
+      else if (f[8] == "UDP,") proto = "udp"
+      else if (f[8] == "Flags") proto = "tcp"
+      key = action " " proto " " src " -> " dst
+      if (!(key in count)) {
+        order[++n] = key
+        first[key] = ts
+        verdict[key] = (action == "block") ? "BLOCK" : "ALLOW"
+        kind[key] = proto
+        flow[key] = src " -> " dst
+      }
+      count[key]++
+      last[key] = ts
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        k = order[i]
+        printf "%s  %s  %-5s %-4s %s  x%d\n", first[k], last[k], verdict[k], kind[k], flow[k], count[k]
+      }
+    }
+  ' "$file"
+}
+
+proxy_pids() {
+  pgrep -f "$SANDBOX_HOME/$1/squid.conf" 2>/dev/null || true
+}
+
+stop_proxy() {
+  local pids
+  pids="$(proxy_pids "$1")"
+  [[ -z "$pids" ]] && return 0
+  kill $pids 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    [[ -z "$(proxy_pids "$1")" ]] && return 0
+    sleep 1
+  done
+  kill -9 $(proxy_pids "$1") 2>/dev/null || true
+}
+
+flush_pf_anchor() {
+  sudo "$PF_HELPER" flush "$1" >/dev/null 2>&1 || true
+}
+
+rollback_up() {
+  local rc=$?
+  [[ $rc -eq 0 ]] && return 0
+  echo "sandbox: 'up $UP_NAME' failed (exit $rc); removing what it created" >&2
+  stop_proxy "$UP_NAME"
+  stop_capture "$UP_NAME"
+  flush_pf_anchor "$UP_NAME"
+  container rm -f "$UP_CONTAINER" >/dev/null 2>&1 || true
+  if ! container network delete "$UP_NETWORK" >/dev/null 2>&1 \
+     && container network list 2>/dev/null | awk '{print $1}' | grep -qx "$UP_NETWORK"; then
+    echo "sandbox: network $UP_NETWORK could not be removed. This is a stale record in the container service." >&2
+    echo "         Reboot your Mac, then run 'sandbox up' again." >&2
+  fi
+  if [[ -d "$UP_DIR" ]]; then
+    local kept="$SANDBOX_HOME/failed/$UP_NAME-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$SANDBOX_HOME/failed"
+    mv "$UP_DIR" "$kept"
+    echo "sandbox: logs from the failed attempt kept in $kept" >&2
+  fi
+}
+
+require_sandbox() {
+  [[ -n "${1:-}" ]] || die "a sandbox name is required"
+  [[ -f "$SANDBOX_HOME/$1/state.json" ]] || die "no sandbox named '$1'"
+}
+
+cmd_up() {
+  local name="${1:-}"
+  shift || true
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] \
+    || die "sandbox name '$name' must be lowercase letters, digits and hyphens (for example: proja). Usage: sandbox up <name> --mode web|network|both [--domains <file>] [--ips <file>] [--strict] [--no-defaults]"
+
+  local mode="" domains="" ips_src="" use_defaults=1 strict=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode) mode="${2:-}"; shift ;;
+      --domains) domains="${2:-}"; shift ;;
+      --ips) ips_src="${2:-}"; shift ;;
+      --no-defaults) use_defaults=0 ;;
+      --strict) strict=1 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  case "$mode" in
+    web)
+      [[ -n "$domains" ]] || die "web mode needs --domains <file>"
+      [[ -z "$ips_src" ]] || die "web mode does not use --ips"
+      ;;
+    network)
+      [[ -n "$ips_src" ]] || die "network mode needs --ips <file>"
+      [[ -z "$domains" ]] || die "network mode does not use --domains"
+      [[ $strict -eq 0 ]] || die "--strict applies to web traffic, so it can't be used in network mode"
+      ;;
+    both)
+      [[ -n "$domains" && -n "$ips_src" ]] || die "both mode needs --domains <file> and --ips <file>"
+      ;;
+    *) die "choose a mode: --mode web | network | both" ;;
+  esac
+  [[ -z "$domains" || -f "$domains" ]] || die "domains file not found: $domains"
+  [[ -z "$ips_src" || -f "$ips_src" ]] || die "IP file not found: $ips_src"
+  [[ -x "$BIN_DIR/check-host.sh" && -f "$CA_DIR/ca.crt" ]] || die "run 'sandbox init' first"
+
+  local dir="$SANDBOX_HOME/$name"
+  [[ -e "$dir" ]] && die "sandbox '$name' already exists"
+
+  UP_NAME="$name" UP_DIR="$dir" UP_CONTAINER="sbx-$name" UP_NETWORK="sbx-$name"
+  trap rollback_up EXIT
+
+  local subnet="" candidate network="sbx-$name" container="sbx-$name"
+  if container network list 2>/dev/null | awk '{print $1}' | grep -qx "$network"; then
+    die "a leftover network named $network exists. Run 'sandbox destroy $name'. If it stays, the container service holds a stale record: reboot your Mac, then retry"
+  fi
+  if container list --all 2>/dev/null | awk '{print $1}' | grep -qx "$container"; then
+    die "a leftover container named $container exists; run 'sandbox destroy $name' or remove it, then retry"
+  fi
+  while IFS= read -r candidate; do
+    container network create "$network" --subnet "$candidate" >/dev/null 2>&1 || continue
+    if probe_network "$network"; then
+      subnet="$candidate"
+      break
+    fi
+    echo "skipping $candidate: outbound test failed" >&2
+    container network delete "$network" >/dev/null 2>&1 || true
+  done < <(candidate_subnets)
+  [[ -n "$subnet" ]] || die "no address range passed the outbound test; reboot, then run 'sandbox up' again"
+  container run -d --name "$container" --network "$network" "$SANDBOX_IMAGE" tail -f /dev/null >/dev/null \
+    || die "failed to start container $container"
+
+  local gateway bridge
+  gateway="$(container inspect "$container" | grep -o '"ipv4Gateway" : "[^"]*"' | head -1 | cut -d'"' -f4)"
+  [[ -n "$gateway" ]] || die "could not read gateway IP for $container"
+  bridge="$(find_bridge "$gateway")"
+
+  mkdir -p "$dir"
+  echo "$mode" > "$dir/access-mode"
+
+  if [[ "$mode" != "network" ]]; then
+    {
+      [[ $use_defaults -eq 1 ]] && cat "$DEFAULTS_FILE"
+      cat "$domains"
+    } | grep -vE '^[[:space:]]*(#|$)' | awk '!seen[$0]++' > "$dir/domains.txt"
+    if [[ $strict -eq 1 ]]; then echo "strict" > "$dir/policy"; else echo "default" > "$dir/policy"; fi
+  fi
+  if [[ "$mode" != "web" ]]; then
+    normalize_ips "$ips_src" "$subnet" "$dir/ips.txt"
+  fi
+
+  printf '{\n  "name": "%s",\n  "network": "%s",\n  "subnet": "%s",\n  "container": "%s",\n  "gateway": "%s",\n  "bridge": "%s",\n  "created": "%s"\n}\n' \
+    "$name" "$network" "$subnet" "$container" "$gateway" "$bridge" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$dir/state.json"
+
+  if [[ "$mode" != "network" ]]; then
+    reload_or_start_proxy "$name"
+  fi
+  load_pf_anchor "$name"
+  if [[ "$mode" != "web" ]]; then
+    start_capture "$name"
+  fi
+
+  echo
+  echo "sandbox $name: container $container on $subnet, gateway $gateway, bridge $bridge"
+  case "$mode" in
+    web)
+      echo "MODE web: only the domains in domains.txt are reachable, through the proxy."
+      echo "          ping, nmap and traceroute are blocked."
+      ;;
+    network)
+      echo "MODE network: ICMP, TCP and UDP to the addresses in ips.txt, on any port, web ports included."
+      echo "          No proxy and no domain checks. Web traffic here is not checked by name."
+      ;;
+    both)
+      echo "MODE both: web goes through the proxy and is checked by domain."
+      echo "          ICMP and TCP/UDP on non-web ports go to the addresses in ips.txt."
+      echo "          Web ports on those addresses are closed to raw traffic, so nmap can't scan 80 or 443."
+      ;;
+  esac
+  if [[ "$mode" != "network" ]]; then
+    echo "proxy on $gateway:$PROXY_PORT, policy: $(cat "$dir/policy")"
+  fi
+}
+
+cmd_strict() {
+  require_sandbox "${1:-}"
+  local name="$1" value="${2:-}" dir="$SANDBOX_HOME/$1" policy
+  [[ "$(cat "$dir/access-mode")" != "network" ]] || die "network mode has no web proxy, so strict mode doesn't apply"
+  case "$value" in
+    on) policy="strict" ;;
+    off) policy="default" ;;
+    *) die "usage: sandbox strict <name> on|off" ;;
+  esac
+  echo "$policy" > "$dir/policy"
+  reload_or_start_proxy "$name"
+  echo "sandbox $name: policy $policy"
+}
+
+cmd_ips() {
+  require_sandbox "${1:-}"
+  local name="$1" file="${2:-}" dir="$SANDBOX_HOME/$1"
+  [[ "$(cat "$dir/access-mode")" != "web" ]] || die "web mode has no IP list"
+  [[ -f "$file" ]] || die "usage: sandbox ips <name> <ip-file>"
+  local subnet
+  subnet="$(json_field "$dir/state.json" subnet)"
+  normalize_ips "$file" "$subnet" "$dir/ips.txt"
+  load_pf_anchor "$name"
+  echo "sandbox $name: $(grep -c . "$dir/ips.txt" || true) address block(s) loaded"
+}
+
+cmd_status() {
+  require_sandbox "${1:-}"
+  local name="$1" dir="$SANDBOX_HOME/$1" state proxy rules
+  state="$(container list --all 2>/dev/null | awk -v c="sbx-$name" '$1==c{print $5}')"
+  proxy="$(proxy_pids "$name")"
+  rules="$(pf_show "$name" | grep -c . || true)"
+  echo "sandbox:   $name"
+  echo "mode:      $(cat "$dir/access-mode")"
+  echo "container: ${state:-missing}"
+  if [[ -f "$dir/policy" ]]; then
+    if [[ -n "$proxy" ]]; then echo "proxy:     running (pid $proxy), policy $(cat "$dir/policy")"; else echo "proxy:     stopped"; fi
+    echo "domains:   $(grep -cvE '^(#|$)' "$dir/domains.txt") allowed"
+  else
+    echo "proxy:     not used in this mode"
+  fi
+  if [[ -f "$dir/ips.txt" ]]; then
+    echo "addresses: $(grep -c . "$dir/ips.txt" || true) block(s) in ips.txt"
+  fi
+  echo "pf rules:  $rules loaded"
+  echo "subnet:    $(json_field "$dir/state.json" subnet)  gateway: $(json_field "$dir/state.json" gateway)"
+}
+
+cmd_logs() {
+  require_sandbox "${1:-}"
+  local name="$1" dir="$SANDBOX_HOME/$1" mode follow=0
+  mode="$(cat "$dir/access-mode")"
+  [[ "${2:-}" == "-f" ]] && follow=1
+  if [[ $follow -eq 1 ]]; then
+    local files=()
+    [[ -f "$dir/access.log" ]] && files+=("$dir/access.log")
+    [[ -f "$dir/pflog.txt" ]] && files+=("$dir/pflog.txt")
+    [[ ${#files[@]} -gt 0 ]] || die "this sandbox has no logs"
+    tail -n 50 -f "${files[@]}"
+    return
+  fi
+  if [[ "$mode" != "network" ]]; then
+    echo "== web (proxy) =="
+    if [[ -f "$dir/access.log" ]]; then
+      tail -n 50 "$dir/access.log"
+    else
+      echo "(no web records yet)"
+    fi
+  fi
+  if [[ "$mode" != "web" ]]; then
+    [[ "$mode" == "both" ]] && echo
+    echo "== network (pf) =="
+    network_flows "$name" | tail -n 50
+  fi
+}
+
+cmd_verify() {
+  require_sandbox "${1:-}"
+  local name="$1" dir="$SANDBOX_HOME/$1" mode gateway container="sbx-$1" failures=0
+  mode="$(cat "$dir/access-mode")"
+  gateway="$(json_field "$dir/state.json" gateway)"
+
+  check() {
+    local label="$1" ok="$2"
+    if [[ "$ok" == "yes" ]]; then
+      echo "PASS  $label"
+    else
+      echo "FAIL  $label"
+      failures=$((failures + 1))
+    fi
+  }
+
+  local code
+  code="$(container exec "$container" sh -c 'nc -z -w 3 8.8.8.8 53 && echo open || echo closed' 2>/dev/null || true)"
+  check "DNS is blocked" "$([[ "$code" == *closed* ]] && echo yes || echo no)"
+
+  code="$(container exec "$container" sh -c "nc -z -w 3 $gateway 22 && echo open || echo closed" 2>/dev/null || true)"
+  check "host SSH is unreachable from the sandbox" "$([[ "$code" == *closed* ]] && echo yes || echo no)"
+
+  code="$(container exec "$container" sh -c 'nc -z -w 5 192.0.2.1 443 && echo open || echo closed' 2>/dev/null || true)"
+  check "an address outside the sandbox policy is blocked" "$([[ "$code" == *closed* ]] && echo yes || echo no)"
+
+  local rules
+  rules="$(pf_show "$name")"
+  check "pf default-deny rule is loaded" "$([[ "$rules" == *"block drop"* ]] && echo yes || echo no)"
+
+  if [[ "$mode" != "network" ]]; then
+    code="$(container exec "$container" sh -c "curl -s -o /dev/null -w '%{http_code}' -m 15 -x http://$gateway:$PROXY_PORT https://www.cloudflare.com/ || true" 2>/dev/null || true)"
+    check "proxy allows an allowed host (got $code)" "$([[ "$code" == 200 ]] && echo yes || echo no)"
+
+    code="$(container exec "$container" sh -c "curl -s -o /dev/null -w '%{http_code}' -m 15 -x http://$gateway:$PROXY_PORT https://example.org/ || true" 2>/dev/null || true)"
+    check "proxy refuses a host not in the list (got $code)" "$([[ "$code" != 200 ]] && echo yes || echo no)"
+
+    check "proxy is running" "$([[ -n "$(proxy_pids "$name")" ]] && echo yes || echo no)"
+  fi
+
+  if [[ "$mode" != "web" ]]; then
+    local cap_pid
+    cap_pid="$(cat "$dir/capture.pid" 2>/dev/null || true)"
+    check "network log is recording" "$([[ -n "$cap_pid" ]] && ps -p "$cap_pid" >/dev/null 2>&1 && echo yes || echo no)"
+  fi
+
+  echo
+  if [[ $failures -eq 0 ]]; then
+    echo "all checks passed"
+  else
+    echo "$failures check(s) failed"
+    return 1
+  fi
+}
+
+cmd_down() {
+  require_sandbox "${1:-}"
+  local name="$1"
+  stop_proxy "$name"
+  stop_capture "$name"
+  flush_pf_anchor "$name"
+  container stop "sbx-$name" >/dev/null 2>&1 || true
+  echo "sandbox $name stopped (state kept)"
+}
+
+cmd_destroy() {
+  require_sandbox "${1:-}"
+  local name="$1" dir="$SANDBOX_HOME/$1" archive
+  cmd_down "$name" >/dev/null
+  container rm -f "sbx-$name" >/dev/null 2>&1 || true
+  container network delete "sbx-$name" >/dev/null 2>&1 || true
+
+  local leftovers=()
+  container list --all 2>/dev/null | awk '{print $1}' | grep -qx "sbx-$name" && leftovers+=("container sbx-$name")
+  container network list 2>/dev/null | awk '{print $1}' | grep -qx "sbx-$name" && leftovers+=("network sbx-$name")
+  [[ -n "$(proxy_pids "$name")" ]] && leftovers+=("proxy process")
+  [[ -n "$(pf_show "$name")" ]] && leftovers+=("pf rules")
+  [[ -f "$dir/capture.pid" ]] && ps -p "$(cat "$dir/capture.pid")" >/dev/null 2>&1 && leftovers+=("network capture")
+
+  archive="$SANDBOX_HOME/archive/$name-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$SANDBOX_HOME/archive"
+  mv "$dir" "$archive"
+  if [[ ${#leftovers[@]} -gt 0 ]]; then
+    echo "sandbox $name destroyed, but these still exist: ${leftovers[*]}" >&2
+    if [[ " ${leftovers[*]} " == *"network"* ]]; then
+      echo "A network that won't delete is a stale record in the container service. Reboot your Mac to clear it." >&2
+    fi
+    echo "Logs are in $archive" >&2
+    return 1
+  fi
+  echo "sandbox $name destroyed; logs and policy archived in $archive"
+}
+
+cmd_list() {
+  local dir name mode state subnet proxy cap found=0
+  local containers
+  containers="$(container list --all 2>/dev/null | awk 'NR>1{print $1" "$5}')"
+  printf '%-14s %-8s %-10s %-18s %-10s %s\n' NAME MODE CONTAINER SUBNET PROXY CAPTURE
+  for dir in "$SANDBOX_HOME"/*/; do
+    name="$(basename "$dir")"
+    [[ -f "$dir/state.json" ]] || continue
+    found=1
+    mode="$(cat "$dir/access-mode" 2>/dev/null || echo unknown)"
+    state="$(awk -v c="sbx-$name" '$1==c{print $2}' <<<"$containers")"
+    subnet="$(json_field "$dir/state.json" subnet)"
+    if [[ "$mode" == "network" ]]; then
+      proxy="n/a"
+    elif [[ -n "$(proxy_pids "$name")" ]]; then
+      proxy="running"
+    else
+      proxy="stopped"
+    fi
+    cap="n/a"
+    if [[ -f "$dir/capture.pid" ]]; then
+      if ps -p "$(cat "$dir/capture.pid")" >/dev/null 2>&1; then cap="running"; else cap="stopped"; fi
+    fi
+    printf '%-14s %-8s %-10s %-18s %-10s %s\n' "$name" "$mode" "${state:-missing}" "$subnet" "$proxy" "$cap"
+  done
+  [[ $found -eq 1 ]] || echo "no sandboxes. Create one with: sandbox up <name> --mode web|network|both ..."
+}
+
+usage() {
+  cat <<'EOF'
+usage: sandbox <command>
+
+  init                                        check dependencies, create the CA, build the image
+  up <name> --mode web|network|both [...]     create a sandbox
+        web:      --domains <file>                      (proxy only, domain-checked)
+        network:  --ips <file>                          (ICMP, TCP, UDP to listed addresses)
+        both:     --domains <file> --ips <file>         (web via proxy, raw to addresses)
+        options:  --strict  --no-defaults   (web and both only)
+  ips <name> <file>                           replace the IP list and reload (network and both)
+  strict <name> on|off                        strict Host/SNI checking (web and both)
+  verify <name>                               run the containment checks (PASS/FAIL)
+  list                                        list every sandbox on this Mac
+  status <name>                               show mode, container, proxy, pf rules and policy
+  logs <name> [-f]                            proxy decisions (web and both)
+  down <name>                                 stop the container, proxy and pf rules (keeps state)
+  destroy <name>                              remove everything and archive logs and policy
+EOF
+}
+
+ensure_container_service() {
+  container list >/dev/null 2>&1 && return 0
+  echo "starting the container service (container system start)..." >&2
+  container system start || die "could not start the container service; run 'container system start' and check its output"
+  container list >/dev/null 2>&1 || die "the container service still isn't responding after 'container system start'"
+}
+
+case "${1:-}" in
+  init) ensure_container_service; cmd_init ;;
+  list) ensure_container_service; cmd_list ;;
+  up) ensure_container_service; shift; cmd_up "$@" ;;
+  ips) ensure_container_service; cmd_ips "${2:-}" "${3:-}" ;;
+  strict) ensure_container_service; cmd_strict "${2:-}" "${3:-}" ;;
+  verify) ensure_container_service; cmd_verify "${2:-}" ;;
+  status) ensure_container_service; cmd_status "${2:-}" ;;
+  logs) cmd_logs "${2:-}" "${3:-}" ;;
+  down) ensure_container_service; cmd_down "${2:-}" ;;
+  destroy) ensure_container_service; cmd_destroy "${2:-}" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
