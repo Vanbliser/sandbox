@@ -1,13 +1,12 @@
 # sandbox
 
-The sandbox tool is specifically built to create sandboxed to run AI pentesting agents on Mac. It is build with the Apple `container` microVM a a host-side firewall. Each sandbox has two lists you control:
+The sandbox tool is specifically built to run AI pentesting agents in isolated environments on your Mac machine. It is build with the Apple `container` microVM and a host-side firewall. Each sandbox has two lists you control:
 
 - **`domains.txt`**: which websites the sandbox may reach, through a checking proxy
 - **`ips.txt`**: which addresses it may reach with network tools (`ping`, `traceroute`, `nmap`)
 
 Every sandbox logs what it tried, and you can cut its network or stop it at any time: `sandbox logs` shows only what the sandbox sent or tried to send.
 
-Shell message
 
 ## The components
 
