@@ -1230,6 +1230,8 @@ Inside a project (the project is found from the current folder):
         -d   domain file (web and both). Optional: an empty list is created if it's missing
         -i   IP file (network and both). Optional: an empty list is created if it's missing
         -p   pinned-host file (web and both). Hosts must also be in the domain list
+        --upstream <host:port>    send web through another proxy, such as Burp (web and both)
+        --upstream-ca <pem>       CA that the upstream proxy signs with, PEM or DER (needs --upstream)
         --strict, --no-defaults   web and both only
   domain <name> <file>                        replace the domain list and reload the proxy (web and both)
   ip <name> <file>                            replace the IP list and reload the firewall (network and both)
@@ -1249,6 +1251,12 @@ Anywhere:
 
 An empty domain or IP file allows nothing for that kind of traffic. A line reading 'all'
 allows every hostname (domains) or every address (IPs). Use it deliberately.
+
+Pinned hosts skip the Host check under strict mode, so use them only for clients that
+reject decrypted traffic. Each one must also be in the domain list.
+
+With an upstream proxy set, every listed host is decrypted and checked by Host/SNI, and
+pinned hosts are inspected too. The upstream must be listening, or web requests fail.
 EOF
 }
 
