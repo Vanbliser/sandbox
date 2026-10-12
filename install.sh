@@ -42,6 +42,10 @@ visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "generated sudo rule is inva
 install -o root -g wheel -m 0440 "$tmp" "$SUDOERS"
 rm -f "$tmp"
 
+# Mac-level setup (CA and image), run as the user so the files are theirs
+echo "setting up this Mac for $USER_NAME (CA and image; the first time takes a few minutes)..."
+sudo -u "$USER_NAME" -H "$REPO_DIR/sandbox" setup
+
 # Per-user part, owned by $USER_NAME
 install -d -o "$USER_NAME" -g staff -m 0755 "$BIN_DIR"
 ln -sfn "$REPO_DIR/sandbox" "$LINK"
@@ -77,8 +81,13 @@ echo "  $HELPER (root-owned, validates every argument)"
 echo "  $SUDOERS (load, show and capture for $USER_NAME, no password)"
 echo "  $LINK -> $REPO_DIR/sandbox"
 echo
-echo "next, in this terminal:"
 if [[ "${PATH_ADDED:-0}" == "1" ]]; then
-  echo "  $reload              (loads the PATH change into this terminal; other terminals pick it up when opened)"
+  echo "first, in this terminal, load the PATH change:"
+  echo "  $reload"
+  echo "(other terminals pick it up when you open them)"
+  echo
 fi
-echo "  sandbox init         (once on this Mac)"
+echo "then, in your project folder (any folder you work in):"
+echo "  cd <your-project>"
+echo "  sandbox init          (makes this folder a sandbox project)"
+echo "  sandbox up <name>     (creates a sandbox in the project)"

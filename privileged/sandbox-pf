@@ -7,7 +7,7 @@
 #   show <name>
 #   flush <name>
 #   capture-start <name> <logfile>   records pf log entries for the sandbox to <logfile>
-#   capture-stop <name>
+#   capture-stop <name> <pidfile>
 set -euo pipefail
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
 
@@ -15,7 +15,7 @@ die() { echo "sandbox-pf: $*" >&2; exit 2; }
 
 cmd="${1:-}"
 name="${2:-}"
-[[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || die "invalid sandbox name"
+[[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,60}$ ]] || die "invalid sandbox name"
 anchor="com.apple/sandbox-$name"
 
 case "$cmd" in
@@ -25,7 +25,7 @@ case "$cmd" in
     [[ "$gateway" == "${subnet%.0/24}.1" ]] || die "gateway does not match subnet"
     [[ "$bridge" =~ ^bridge[0-9]{1,4}$ ]] || die "invalid bridge name"
     [[ "$port" == "3128" ]] || die "invalid proxy port"
-    case "$mode" in web|network|both) ;; *) die "invalid mode" ;; esac
+    case "$mode" in web|network|both|both-open) ;; *) die "invalid mode" ;; esac
 
     /sbin/ifconfig pflog0 >/dev/null 2>&1 || /sbin/ifconfig pflog0 create
 
@@ -42,9 +42,19 @@ case "$cmd" in
         for o in "$o1" "$o2" "$o3" "$o4"; do
           (( 10#$o <= 255 )) || die "invalid address entry: $cidr"
         done
-        (( 10#$pfx >= 8 )) || die "address entry too broad: $cidr"
+        if [[ "$cidr" != "0.0.0.0/0" ]]; then
+          (( 10#$pfx >= 8 )) || die "address entry too broad: $cidr"
+        fi
         [[ "$o1.$o2.$o3" != "${subnet%.0/24}" ]] || die "address entry overlaps the sandbox subnet: $cidr"
-        if [[ "$mode" == "both" ]]; then
+        if [[ "$cidr" == "0.0.0.0/0" ]]; then
+          while read -r own_ip; do
+            rules+=$'\n'"block drop quick on $bridge from $subnet to $own_ip"
+          done < <(ifconfig | awk '$1=="inet"{print $2}')
+        fi
+        block_web=0
+        [[ "$mode" == "both" ]] && block_web=1
+        [[ "$mode" == "both-open" && "$cidr" != "0.0.0.0/0" ]] && block_web=1
+        if [[ $block_web -eq 1 ]]; then
           rules+=$'\n'"block drop log quick on $bridge proto tcp from $subnet to $cidr port { 80 443 }"
         fi
         rules+=$'\n'"pass log quick on $bridge proto { tcp udp } from $subnet to $cidr keep state"
@@ -65,9 +75,11 @@ case "$cmd" in
     logfile="${3:-}"
     owner="${SUDO_USER:-}"
     [[ -n "$owner" && "$owner" != "root" ]] || die "capture must be started through sudo"
-    [[ "$logfile" == /Users/*/.sandbox/"$name"/pflog.txt ]] || die "invalid log path"
+    [[ "$logfile" == /*/.sandbox/sandboxes/"$name"/pflog.txt ]] || die "invalid log path"
     [[ "$logfile" != *..* ]] || die "invalid log path"
-    pidfile="${logfile%pflog.txt}capture.pid"
+    [[ ! -L "$logfile" && ! -L "$(dirname "$logfile")" ]] || die "log path must not be a symlink"
+    [[ "$(stat -f %Su "$(dirname "$logfile")")" == "$owner" ]] || die "log folder must belong to $owner"
+    pidfile="$(dirname "$logfile")/capture.pid"
     [[ -f "$pidfile" ]] && kill "$(cat "$pidfile")" 2>/dev/null || true
     /sbin/ifconfig pflog0 >/dev/null 2>&1 || /sbin/ifconfig pflog0 create
     : > "$logfile"
@@ -77,8 +89,12 @@ case "$cmd" in
     chown "$owner" "$pidfile"
     ;;
   capture-stop)
-    pidfile="/Users/${SUDO_USER:-x}/.sandbox/$name/capture.pid"
-    [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != root ]] || die "capture-stop must be run through sudo"
+    pidfile="${3:-}"
+    owner="${SUDO_USER:-}"
+    [[ -n "$owner" && "$owner" != "root" ]] || die "capture-stop must be run through sudo"
+    [[ "$pidfile" == /*/.sandbox/sandboxes/"$name"/capture.pid ]] || die "invalid pid path"
+    [[ "$pidfile" != *..* ]] || die "invalid pid path"
+    [[ ! -L "$pidfile" ]] || die "pid path must not be a symlink"
     if [[ -f "$pidfile" ]]; then
       kill "$(cat "$pidfile")" 2>/dev/null || true
       rm -f "$pidfile"
