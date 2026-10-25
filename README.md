@@ -337,7 +337,7 @@ sandbox upstream <name> none
 ```
 
 - `--upstream-ca` adds the upstream's CA to the trust list for the upstream leg. Without it, the upstream's certificates must be trusted by this Mac.
-- `status` shows the upstream and whether a CA is trusted. `up` and `upstream` print the same.
+- `status` shows the upstream and whether a CA is trusted. `up` and `upstream` also print the upstream when it's set.
 - Upstream settings are committed with the project.
 
 **Headers and cookies** are recorded per domain in sessions/sessions.json. This happens for every allowed request, with no flag needed. The folder is mounted read-only in the sandbox at /root/sessions. The file holds credentials in plain text, so keep it out of git.
