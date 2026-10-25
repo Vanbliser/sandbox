@@ -112,7 +112,7 @@ There are three levels:
 
 1. **Your Mac, once.** `sudo ./install.sh` installs the firewall helper, the `sandbox` command, and the Mac-level setup (the CA and the sandbox image).
 2. **A project folder.** Any folder you work in can become a sandbox project. `sandbox init` makes it one. The project's settings, lists and logs live in its `.sandbox/` folder.
-3. **Sandboxes in a project.** A project can have as many sandboxes as you need. Each one is named after the project, for example `webapp-app1`. Sandbox names are <project>-<sandbox>, and that's also the directory name under .sandbox/sandboxes/. Containers, networks and pf anchors use the same name, so projects can't collide.
+3. **Sandboxes in a project.** A project can have as many sandboxes as you need. Each one is named after the project, for example `webapp-app1`. Sandbox names are `<project>-<sandbox>`, and that's also the directory name under .sandbox/sandboxes/. Containers, networks and pf anchors use the same name, so projects can't collide.
 
 ```
 ~/your-projects/webapp/          <- a sandbox project
@@ -345,7 +345,7 @@ sandbox upstream <name> none
 **Browser folder and interface**
 
 - browser/ is mounted read-write at /root/browser. Any tool in the sandbox can store its data there. It survives down and start, and destroy archives it.
-- up --ui starts a web interface on 127.0.0.1:6080 (no password). ui <name> opens it. Its first pane is the sandbox desktop, where Chromium runs.
+- up --ui starts a web interface on 127.0.0.1:6080 (no password). ui `<name>` opens it. Its first pane is the sandbox desktop, where Chromium runs.
 
 ## What's enforced
 
