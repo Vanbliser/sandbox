@@ -56,12 +56,7 @@ case "$cmd" in
             rules+=$'\n'"block drop quick on $bridge from $subnet to $own_ip"
           done < <(ifconfig | awk '$1=="inet"{print $2}')
         fi
-        block_web=0
-        [[ "$mode" == "both" ]] && block_web=1
-        [[ "$mode" == "both-open" && "$cidr" != "0.0.0.0/0" ]] && block_web=1
-        if [[ $block_web -eq 1 ]]; then
-          rules+=$'\n'"block drop log quick on $bridge proto tcp from $subnet to $cidr port { 80 443 }"
-        fi
+        # web and both: web ports are open to the addresses. Only the proxy checks names, and the operator chooses the addresses.
         rules+=$'\n'"pass log quick on $bridge proto { tcp udp } from $subnet to $cidr keep state"
         rules+=$'\n'"pass log quick on $bridge proto icmp from $subnet to $cidr"
       done

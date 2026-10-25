@@ -251,7 +251,7 @@ app.example.com
 | Uses | `domains.txt` | `ips.txt` | both files |
 | Web (HTTP and HTTPS) | Listed hosts, through the proxy | Raw, to listed addresses, web ports included | Listed hosts, through the proxy |
 | `ping`, `traceroute`, non-web TCP/UDP | Blocked | To listed addresses | To listed addresses |
-| `nmap` on web ports (80, 443) | Blocked | To listed addresses | Blocked, unless both lists are `all` |
+| `nmap` on web ports (80, 443) | Blocked | To listed addresses | To listed addresses |
 | Logging | Proxy log | pf network log | Both logs |
 
 ## How the two lists combine
@@ -260,8 +260,8 @@ Both lists are optional. An empty list allows nothing for that kind of traffic.
 
 | Domains | IPs | What the sandbox can reach |
 |---|---|---|
-| listed names | listed addresses | Listed websites through the proxy. Ping and non-web TCP/UDP to listed addresses. Web ports on those addresses stay closed to raw traffic. |
-| listed names | `all` | As above, but ping and non-web TCP/UDP to every address. |
+| listed names | listed addresses | Listed websites through the proxy. Ping, TCP/UDP and web ports (direct, not through the proxy) to listed addresses. Only list addresses you own or trust. |
+| listed names | `all` | As above, but ping, TCP/UDP and web ports (direct) to every address. Web traffic to any address bypasses the proxy and the domain check. |
 | `all` | `all` | Any website through the proxy. Any address on any port, including web ports. Web traffic to any address bypasses the proxy and the domain check. |
 | empty | empty | Nothing. |
 
@@ -365,7 +365,8 @@ sandbox upstream <name> none
 Read these before relying on a sandbox:
 
 - **Raw traffic isn't checked by name.** Anything sent to a listed address goes straight there, so the proxy never sees it.
-- **Web ports on raw addresses bypass the proxy when both lists are `all`.** Tools can then reach any web server directly, with no domain check.
+- **Web ports on raw addresses bypass the proxy when the address list is `all`.** Tools can then reach any web server directly, with no domain check.
+- **Listed addresses are open on web ports in `both` mode.** Direct web traffic to a listed address skips the proxy, so the domain, Host and SNI checks don't apply to it. Only list addresses you own or trust. A listed CDN or shared host serves other sites too.
 - **Raw traffic to a listed address bypasses the proxy on any port.** Web traffic sent through the proxy is checked by name on any port, including 8080. But a tool that connects directly to a listed IP on port 8080 or 8000 isn't checked by name.
 - **Shared-hosting addresses serve other sites.** A listed address on a CDN can serve sites you never approved, and raw traffic reaches them too.
 - **Pinned clients.** Pinned hosts pass through undecrypted, so their certificates work but their traffic isn't recorded. Other hosts are decrypted, so a client that pins a certificate and isn't on the pinned list will fail there.

@@ -560,7 +560,7 @@ ip_all_warning() {
   if [[ -f "$1/domains.txt" ]] && grep -qx all "$1/domains.txt"; then
     echo "WARNING: 'all' is set for both lists. Every address is reachable, web ports included, so web traffic to any address bypasses the proxy and the domain check. This Mac and DNS stay blocked."
   else
-    echo "WARNING: 'all' is set for addresses. Every address is reachable for ping, TCP and UDP. Web ports stay closed to raw traffic unless domains is also 'all'. This Mac and DNS stay blocked."
+    echo "WARNING: 'all' is set for addresses. Every address is reachable directly, on any port, including web ports. Web traffic to any address bypasses the proxy and the domain check. This Mac and DNS stay blocked."
   fi
 }
 
@@ -813,7 +813,7 @@ cmd_up() {
     both)
       echo "MODE both: web goes through the proxy and is checked by domain."
       echo "          ICMP and TCP/UDP on non-web ports go to the addresses in ips.txt."
-      echo "          Web ports on those addresses are closed to raw traffic, so nmap can't scan 80 or 443."
+      echo "          Web ports on those addresses are open to direct traffic too, so list only addresses you own or trust."
       ;;
   esac
   if [[ "$mode" != "network" ]]; then
