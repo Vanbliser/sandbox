@@ -60,6 +60,28 @@ pf rules need root. Rather than give the tool full sudo, the installer adds:
 `flush` isn't in that rule, so it needs your password. `down` and `destroy` run it and hide any error. If the rules are still there afterwards, `destroy` reports them. Clear them with `sudo /usr/local/libexec/sandbox-pf flush <project>-<name>`.
 
 
+## Update the tool
+
+Do this after you pull a new version of the tool:
+
+```bash
+cd sandbox
+git pull
+sudo ./install.sh     # reinstalls the firewall helper and the sudo rule, then runs setup
+sandbox verify <name> # for each sandbox you use
+```
+
+`sudo ./install.sh` runs `setup` for you. Setup copies the proxy addon to `~/.sandbox/bin/`, refreshes the trust roots, and rebuilds the image if its files changed.
+
+Sandboxes that already exist keep the settings they started with, so restart them to pick up changes:
+
+- **Proxy or addon changes:** `sandbox down <name>`, then `sandbox start <name>`.
+- **Firewall rule changes:** `sandbox start <name>` reloads the rules. You don't need to recreate the sandbox.
+- **Image changes** (new packages in the image): recreate the sandbox with `sandbox destroy <name>`, then `sandbox up <name>`. `destroy` may leave pf rules behind, so flush them before you recreate the sandbox:
+  `sudo /usr/local/libexec/sandbox-pf flush <project>-<name>`
+
+If the helper is out of date, `up` and `start` fail, or the firewall rules don't match the script. Running `sudo ./install.sh` fixes that.
+
 ## Commands
 
 | Command | What it does |
