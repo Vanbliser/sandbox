@@ -79,7 +79,7 @@ require_sandbox() {
 }
 
 cmd_init() {
-  [[ -f "$CA_DIR/ca.crt" && -x "$BIN_DIR/check-host.sh" ]] \
+  [[ -f "$CA_DIR/ca.crt" && -f "$BIN_DIR/sbx_addon.py" ]] \
     || die "this Mac isn't set up yet. Run: sudo ./install.sh"
   local here="$PWD" a pname
   if [[ -f "$here/.sandbox/project.json" ]]; then
@@ -103,12 +103,14 @@ cmd_init() {
 sandboxes/*/state.json
 sandboxes/*/domains.txt
 sandboxes/*/ips.txt
-sandboxes/*/squid.conf
+sandboxes/*/env
+sandboxes/*/browser/
+sandboxes/*/sessions/
+sandboxes/*/mitm/
 sandboxes/*/*.log
 sandboxes/*/*.out
 sandboxes/*/*.pid
 sandboxes/*/pflog.txt
-sandboxes/*/ssl_db/
 archive/
 failed/
 EOF
@@ -122,65 +124,10 @@ EOF
 
 write_helper() {
   mkdir -p "$BIN_DIR"
-  cat > "$BIN_DIR/check-host.sh" <<'EOF'
-#!/usr/bin/env bash
-# Squid external ACL helper.
-# Input per request: "<sni> <host> <dest_ip>", with "-" for empty fields.
-# Args: <policy: default|strict> <domains file>
-set -u
-mode="$1"
-domains="$2"
 
-norm() {
-  local v="$1"
-  v="${v%%:*}"
-  v="${v%.}"
-  printf '%s' "$v" | tr 'A-Z' 'a-z'
-}
-
-listed() {
-  local h="$1" d
-  grep -qx all "$domains" && return 0
-  while IFS= read -r d; do
-    d="${d%%#*}"
-    d="$(printf '%s' "$d" | tr -d '[:space:]')"
-    [[ -z "$d" ]] && continue
-    d="$(norm "$d")"
-    [[ "$h" == "$d" ]] && return 0
-    [[ "$d" == .* && "$h" == *"$d" ]] && return 0
-  done < "$domains"
-  return 1
-}
-
-while read -r sni host dest; do
-  sni="$(norm "${sni:--}")"
-  host="$(norm "${host:--}")"
-  dest="${dest:--}"
-  [[ "$sni" == "-" ]] && sni=""
-  if [[ -z "$host" || "$host" == "-" ]]; then
-    echo "ERR message=no-host-header"; continue
-  fi
-  if ! listed "$host"; then
-    echo "ERR message=host-not-in-domains"; continue
-  fi
-  if [[ "$mode" == "strict" ]]; then
-    if [[ "$sni" != "$host" ]]; then
-      echo "ERR message=sni-host-mismatch"; continue
-    fi
-    echo "OK"; continue
-  fi
-  if [[ -n "$sni" ]]; then
-    echo "ERR message=sni-not-listed"; continue
-  fi
-  addrs="$( { dig +short A "$host"; dig +short AAAA "$host"; } 2>/dev/null || true )"
-  if [[ "$dest" != "-" ]] && grep -qxF "$dest" <<<"$addrs"; then
-    echo "OK"
-  else
-    echo "ERR message=dest-not-address-of-host"
-  fi
-done
-EOF
-  chmod 755 "$BIN_DIR/check-host.sh"
+  # The proxy addon: enforces the lists and records headers and cookies. It runs with mitmproxy.
+  cp "$SCRIPT_DIR/addon/sbx_addon.py" "$BIN_DIR/sbx_addon.py"
+  chmod 644 "$BIN_DIR/sbx_addon.py"
 }
 
 export_trusted_roots() {
@@ -204,15 +151,52 @@ export_trusted_roots() {
   echo "exported $(ls "$out" | wc -l | tr -d ' ') trusted roots from this Mac"
 }
 
+# Downloads Playwright 1.59.1 (the version numasec pins) and its Chromium into the build context, for Linux
+# in this Mac's architecture. Later builds reuse the download.
+stage_playwright() {
+  local pw="$1/pw" ver="1.59.1" platform
+  [[ -d "$pw/ms-playwright" && -f "$pw/playwright-core-$ver.tgz" ]] && return 0
+  case "$(uname -m)" in
+    arm64) platform="ubuntu24.04-arm64" ;;
+    x86_64) platform="ubuntu24.04-x64" ;;
+    *) die "no Playwright build for $(uname -m)" ;;
+  esac
+  mkdir -p "$pw"
+  echo "downloading Playwright $ver and Chromium for $platform (about 1 GB, once)..."
+  curl -sS --retry 3 -m 300 -o "$pw/playwright-core-$ver.tgz" \
+    "https://registry.npmjs.org/playwright-core/-/playwright-core-$ver.tgz" \
+    || die "could not download playwright-core $ver from the npm registry"
+  rm -rf "$pw/package"
+  tar -xzf "$pw/playwright-core-$ver.tgz" -C "$pw" || die "could not unpack playwright-core $ver"
+  PLAYWRIGHT_BROWSERS_PATH="$pw/ms-playwright" PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="$platform" \
+    node "$pw/package/cli.js" install chromium >"$pw/install.log" 2>&1 \
+    || die "could not download Chromium for Playwright; see $pw/install.log"
+}
+
 build_image() {
   local ctx="$SANDBOX_HOME/image"
   mkdir -p "$ctx"
+  stage_playwright "$ctx"
   export_trusted_roots "$ctx"
+  cat "$ctx"/trusted-roots/*.crt > "$ROOTS_PEM"
   cat > "$ctx/Containerfile" <<'EOF'
-FROM alpine:3.20
-RUN apk add --no-cache curl ca-certificates nodejs npm nmap
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm nmap netcat-openbsd libnss3-tools xvfb x11vnc novnc websockify \
+ && rm -rf /var/lib/apt/lists/*
+# Playwright 1.59.1 is the version numasec pins. It and its Chromium are staged on the Mac (stage_playwright),
+# so the build doesn't depend on the npm registry.
+COPY pw/ /opt/pw/
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw/ms-playwright
+RUN npm install -g /opt/pw/playwright-core-1.59.1.tgz \
+ && node /opt/pw/package/cli.js install-deps chromium \
+ && rm -rf /var/lib/apt/lists/*
 COPY trusted-roots/ /usr/local/share/ca-certificates/
 RUN update-ca-certificates
+# Chromium on Linux reads its own NSS database, not the system bundle. Import the same roots so the browser trusts them.
+RUN mkdir -p /root/.pki/nssdb && certutil -d sql:/root/.pki/nssdb -N --empty-password \
+ && for f in /usr/local/share/ca-certificates/*.crt; do certutil -d sql:/root/.pki/nssdb -A -t "C,," -n "$(basename "$f")" -i "$f"; done
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
@@ -233,7 +217,7 @@ cmd_setup() {
   command -v dig >/dev/null 2>&1 || die "dig not found; it ships with macOS"
   command -v python3 >/dev/null 2>&1 || die "python3 not found; install the Xcode Command Line Tools (xcode-select --install)"
 
-  ensure_brew_pkg squid squid
+  ensure_brew_pkg mitmdump mitmproxy
 
   mkdir -p "$CA_DIR"
   chmod 700 "$SANDBOX_HOME" "$CA_DIR"
@@ -285,13 +269,6 @@ find_bridge() {
     $1 == "inet" && $2 == ip { print iface; found = 1; exit }
     END { exit !found }
   ' || die "no bridge interface carries gateway $ip"
-}
-
-find_certgen() {
-  local p
-  p="$(find -L "$(brew --prefix squid)" \( -name security_file_certgen -o -name cert_generator \) -type f 2>/dev/null | head -1)"
-  [[ -n "$p" ]] || die "certificate helper (security_file_certgen) not found in the squid install"
-  echo "$p"
 }
 
 # Turns an address file into CIDR blocks. Accepts single addresses, a-b ranges, CIDR blocks,
@@ -372,7 +349,7 @@ host_listed() {
 }
 
 # Checks a pinned-host file against the allowed list $2. Writes the cleaned list to $3.
-# Pinned hosts skip the Host check under strict mode, so each one must already be allowed.
+# Pinned hosts pass through without decryption (no Host check, no header capture), so each one must already be allowed.
 check_pinned_file() {
   local file="$1" allowed="$2" out="$3" h
   check_domain_file "$file" "$out.raw"
@@ -432,145 +409,71 @@ check_upstream() {
 
 # ---------------------------------------------------------------- proxy and firewall
 
-write_squid_conf() {
-  local name="$1" dir="$SB_BASE/$1"
-  local gateway policy certgen bump listed_acl="" pinned_acl="" d
-  gateway="$(json_field "$dir/state.json" gateway)"
-  policy="$(cat "$dir/policy")"
-  certgen="$(find_certgen)"
-
-  while IFS= read -r d; do
-    d="${d%%#*}"
-    d="$(printf '%s' "$d" | tr -d '[:space:]')"
-    [[ -z "$d" ]] && continue
-    if [[ "$d" == "all" ]]; then
-      listed_acl+="acl listed_dst dstdom_regex ."$'\n'
-    else
-      listed_acl+="acl listed_dst dstdomain $d"$'\n'
-    fi
-  done < "$dir/domains.txt"
-
-  # A pinned host that is no longer in the domain list is skipped, not spliced.
-  if [[ -s "$dir/pinned.txt" ]]; then
-    while IFS= read -r d; do
-      [[ -z "$d" ]] && continue
-      host_listed "$d" "$dir/domains.txt" || continue
-      pinned_acl+="acl pinned_dst dstdomain $d"$'\n'
-    done < "$dir/pinned.txt"
-  fi
-
-  # Strict: pinned hosts are spliced (not decrypted) before the blanket bump, so they skip the Host check.
-  # Default: listed hosts are already spliced, so pinned hosts need no extra rule.
-  bump=""
-  if [[ "$policy" == "strict" ]]; then
-    [[ -n "$pinned_acl" ]] && bump="ssl_bump splice pinned_dst"$'\n'
-  else
-    bump="ssl_bump splice listed_dst"$'\n'
-  fi
-  bump+="ssl_bump bump all"
-
-  # Upstream proxy (for example Burp): web traffic goes to it instead of straight out. Squid must
-  # trust that proxy's CA on the upstream leg, so the CA file goes to tls_outgoing_options.
-  local peer_block=""
-  if [[ -s "$dir/upstream" ]]; then
-    # Splicing would pass the upstream's certificate to the client, which doesn't trust it, so
-    # listed hosts are decrypted and the upstream sees them. The default address check can't work
-    # either, because Squid's server connection goes to the upstream, so the Host/SNI check is used.
-    # Pinned hosts don't skip inspection while an upstream is set.
-    policy="strict"
-    bump="ssl_bump bump all"
-    local up_spec up_host up_port
-    up_spec="$(cat "$dir/upstream")"
-    up_host="${up_spec%:*}"
-    up_port="${up_spec##*:}"
-    peer_block="cache_peer $up_host parent $up_port 0 no-query default proxy-only no-digest"$'\n'
-    peer_block+="never_direct allow all"$'\n'
-    peer_block+="always_direct deny all"$'\n'
-    if [[ -s "$dir/upstream-ca.pem" ]]; then
-      peer_block+="tls_outgoing_options cafile=$dir/upstream-ca.pem"$'\n'
-    fi
-  fi
-
-  cat > "$dir/squid.conf" <<EOF
-pid_filename $dir/squid.pid
-cache_log $dir/cache.log
-access_log $dir/access.log
-coredump_dir $dir
-cache deny all
-via off
-forwarded_for delete
-http_port $gateway:$PROXY_PORT ssl-bump cert=$CA_DIR/ca.crt key=$CA_DIR/ca.key generate-host-certificates=on dynamic_cert_mem_cache_size=4MB
-sslcrtd_program $certgen -s $dir/ssl_db -M 4MB
-sslcrtd_children 2 startup=1
-sslproxy_session_cache_size 0
-$peer_block
-acl step1 at_step SslBump1
-acl step2 at_step SslBump2
-$listed_acl$pinned_acl
-ssl_bump peek step1
-$bump
-external_acl_type sbx_check ttl=0 children-max=4 %ssl::>sni %>h{Host} %<la $BIN_DIR/check-host.sh $policy $dir/domains.txt
-acl ipdst dstdom_regex ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\$
-http_access allow CONNECT listed_dst
-http_access allow CONNECT ipdst
-http_access deny CONNECT
-acl sbx_ok external sbx_check
-http_access allow sbx_ok
-http_access deny all
-EOF
-}
+# The web proxy is mitmproxy: one process per sandbox, on the sandbox's gateway. The addon
+# (~/.sandbox/bin/sbx_addon.py) enforces the lists and records headers and cookies.
+ROOTS_PEM="$SANDBOX_HOME/roots.pem"
 
 proxy_pids() {
-  pgrep -f "$SB_BASE/$1/squid.conf" 2>/dev/null || true
+  local pid
+  pid="$(cat "$SB_BASE/$1/proxy.pid" 2>/dev/null || true)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+  return 0
 }
 
+# The bundle mitmproxy checks upstream certificates against: this Mac's roots, plus the upstream proxy's CA
+# when one is set (Burp's CA, for example).
+proxy_trust_bundle() {
+  local dir="$1" out="$1/mitm/upstream-trust.pem"
+  cat "$ROOTS_PEM" > "$out"
+  if [[ -s "$dir/upstream-ca.pem" ]]; then cat "$dir/upstream-ca.pem" >> "$out"; fi
+  chmod 600 "$out"
+  echo "$out"
+}
+
+# Starts the proxy for a sandbox, restarting it if it runs. Domain, pin and upstream changes go through here.
 reload_or_start_proxy() {
-  local name="$1" dir="$SB_BASE/$1"
-  write_squid_conf "$name"
-  squid -k parse -f "$dir/squid.conf" >"$dir/parse.log" 2>&1 \
-    || die "squid config invalid; see $dir/parse.log"
-
-  if [[ -n "$(proxy_pids "$name")" ]]; then
-    squid -k reconfigure -f "$dir/squid.conf" >>"$dir/parse.log" 2>&1 \
-      || die "squid reconfigure failed; see $dir/parse.log"
-    return 0
-  fi
-
-  local gateway
+  local name="$1" dir="$SB_BASE/$1" gateway trust
+  local args=()
   gateway="$(json_field "$dir/state.json" gateway)"
+  stop_proxy "$name"
   if nc -z "$gateway" "$PROXY_PORT" 2>/dev/null; then
     die "$gateway:$PROXY_PORT is already in use by another process (see: lsof -nP -iTCP:$PROXY_PORT -sTCP:LISTEN)"
   fi
-
-  if [[ ! -f "$dir/ssl_db/index.txt" ]]; then
-    "$(find_certgen)" -c -s "$dir/ssl_db" -M 4MB >>"$dir/parse.log" 2>&1 \
-      || die "could not create the certificate cache; see $dir/parse.log"
+  mkdir -p "$dir/mitm"
+  chmod 700 "$dir/mitm"
+  # mitmproxy signs certificates with the sandbox CA, so it reads the key and the certificate from one PEM file.
+  cat "$CA_DIR/ca.key" "$CA_DIR/ca.crt" > "$dir/mitm/mitmproxy-ca.pem"
+  chmod 600 "$dir/mitm/mitmproxy-ca.pem"
+  trust="$(proxy_trust_bundle "$dir")"
+  args=(--listen-host "$gateway" --listen-port "$PROXY_PORT" --set "confdir=$dir/mitm"
+        --set "ssl_verify_upstream_trusted_ca=$trust" -s "$BIN_DIR/sbx_addon.py")
+  if [[ -s "$dir/upstream" ]]; then
+    args+=(--mode "upstream:http://$(cat "$dir/upstream")")
   fi
-
-  squid -N -f "$dir/squid.conf" >"$dir/squid.out" 2>&1 &
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  SBX_DIR="$dir" nohup mitmdump "${args[@]}" >"$dir/proxy.out" 2>&1 &
+  echo $! > "$dir/proxy.pid"
+  for _ in $(seq 1 15); do
     if nc -z "$gateway" "$PROXY_PORT" 2>/dev/null && [[ -n "$(proxy_pids "$name")" ]]; then
       return 0
     fi
     sleep 1
   done
-  echo "--- squid.out ---" >&2
-  tail -n 15 "$dir/squid.out" >&2 2>/dev/null || true
-  echo "--- cache.log ---" >&2
-  tail -n 15 "$dir/cache.log" >&2 2>/dev/null || true
-  die "proxy did not start on $gateway:$PROXY_PORT"
+  echo "--- proxy.out ---" >&2
+  tail -n 15 "$dir/proxy.out" >&2 2>/dev/null || true
+  die "the proxy did not start; see $dir/proxy.out"
 }
 
 stop_proxy() {
   local pids
   pids="$(proxy_pids "$1")"
-  [[ -z "$pids" ]] && return 0
+  if [[ -z "$pids" ]]; then rm -f "$SB_BASE/$1/proxy.pid"; return 0; fi
   kill $pids 2>/dev/null || true
   for _ in 1 2 3 4 5; do
-    [[ -z "$(proxy_pids "$1")" ]] && return 0
+    if [[ -z "$(proxy_pids "$1")" ]]; then rm -f "$SB_BASE/$1/proxy.pid"; return 0; fi
     sleep 1
   done
-  kill -9 $(proxy_pids "$1") 2>/dev/null || true
+  kill -9 $pids 2>/dev/null || true
+  rm -f "$SB_BASE/$1/proxy.pid"
 }
 
 load_pf_anchor() {
@@ -590,7 +493,9 @@ load_pf_anchor() {
       [[ -n "$cidr" ]] && cidrs+=("$cidr")
     done < "$dir/ips.txt"
   fi
-  sudo -n "$PF_HELPER" load "$name" "$subnet" "$gateway" "$bridge" "$PROXY_PORT" "$mode" \
+  local ui_arg="none"
+  if [[ -f "$dir/ui" ]]; then ui_arg="$UI_PORT"; fi
+  sudo -n "$PF_HELPER" load "$name" "$subnet" "$gateway" "$bridge" "$PROXY_PORT" "$mode" "$ui_arg" \
     ${cidrs[@]+"${cidrs[@]}"} >"$dir/pf.out" 2>&1 \
     || die "could not load pf rules for $name (see $dir/pf.out)"
   echo "pf rules loaded for $name ($mode mode)"
@@ -688,17 +593,37 @@ rollback_up() {
   fi
 }
 
+# The sandbox interface: a web page on 127.0.0.1 (no password, as chosen) for working inside the sandbox.
+# Right now it shows the sandbox's virtual desktop, where Chromium runs, through noVNC. Other panes can be
+# added later under the same port. Anyone on this Mac can open it while the sandbox runs.
+UI_PORT="${UI_PORT:-6080}"
+start_ui() {
+  # The VNC server listens on the container's loopback only. websockify serves noVNC on UI_PORT and bridges it.
+  container exec -d "$1" sh -c 'Xvfb :99 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 & sleep 1; x11vnc -display :99 -forever -shared -nopw -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 & websockify --web /usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1' \
+    || die "could not start the sandbox interface in $1"
+}
+
+cmd_ui() {
+  require_sandbox "${1:-}"
+  local dir="$DIR" url="http://127.0.0.1:$UI_PORT/vnc.html?autoconnect=true&resize=scale"
+  [[ -f "$dir/ui" ]] || die "sandbox '$1' was started without the interface. Run: sandbox destroy $1, then: sandbox up $1 --ui"
+  echo "sandbox interface: $url"
+  echo "(no password, open only while this Mac is trusted. Browser is the first pane.)"
+  open "$url" >/dev/null 2>&1 || true
+}
+
 cmd_up() {
   local short="${1:-}"
   shift || true
-  [[ -n "$short" ]] || die "usage: sandbox up <name> [-m web|network|both] [-d <domains-file>] [-i <ips-file>] [-p <pinned-file>] [--upstream <host:port> [--upstream-ca <pem>]] [--strict] [--no-defaults]"
+  [[ -n "$short" ]] || die "usage: sandbox up <name> [-m web|network|both] [-d <domains-file>] [-i <ips-file>] [-p <pinned-file>] [--upstream <host:port> [--upstream-ca <pem>]] [--no-defaults]"
   set_sandbox_names "$short"
   local name="$NAME" dir="$DIR"
 
-  local mode="" mode_given=0 domains="" ips_src="" pin_src="" up_spec="" up_ca="" use_defaults=1 defaults_given=0 strict=0
+  local mode="" mode_given=0 domains="" ips_src="" pin_src="" up_spec="" up_ca="" use_defaults=1 defaults_given=0
+  local env_args=() env_file_src="" ui=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -m|--mode|-d|--domains|-i|--ips|-p|--pinned|--upstream|--upstream-ca)
+      -m|--mode|-d|--domains|-i|--ips|-p|--pinned|--upstream|--upstream-ca|-e|--env|--env-file)
         [[ $# -ge 2 ]] || die "$1 needs a value"
         case "$1" in
           -m|--mode) mode="$2"; mode_given=1 ;;
@@ -706,12 +631,14 @@ cmd_up() {
           -p|--pinned) pin_src="$2" ;;
           --upstream) up_spec="$2" ;;
           --upstream-ca) up_ca="$2" ;;
+          -e|--env) env_args+=("$2") ;;
+          --env-file) env_file_src="$2" ;;
           *) ips_src="$2" ;;
         esac
         shift
         ;;
       --no-defaults) use_defaults=0; defaults_given=1 ;;
-      --strict) strict=1 ;;
+      --ui) ui=1 ;;
       *) die "unknown option: $1" ;;
     esac
     shift
@@ -729,8 +656,9 @@ cmd_up() {
     if [[ -z "$pin_src" && -f "$dir/pinned.txt" ]]; then pin_src="$dir/pinned.txt"; fi
     if [[ -z "$up_spec" && -f "$dir/upstream" ]]; then up_spec="$(cat "$dir/upstream")"; fi
     if [[ -z "$up_ca" && -f "$dir/upstream-ca.pem" ]]; then up_ca="$dir/upstream-ca.pem"; fi
+    if [[ -z "$env_file_src" && ${#env_args[@]} -eq 0 && -f "$dir/env" ]]; then env_file_src="$dir/env"; fi
+    if [[ -f "$dir/ui" ]]; then ui=1; fi
     if [[ $defaults_given -eq 0 && -f "$dir/defaults" ]]; then use_defaults="$(cat "$dir/defaults")"; fi
-    if [[ -f "$dir/policy" && "$(cat "$dir/policy")" == "strict" && $strict -eq 0 ]]; then strict=1; fi
   fi
   mode="${mode:-both}"
 
@@ -740,7 +668,6 @@ cmd_up() {
   esac
   [[ "$mode" != "network" || -z "$domains" ]] || die "network mode has no proxy, so it doesn't use a domain file (-d). Use -m web or -m both"
   [[ "$mode" != "web" || -z "$ips_src" ]] || die "web mode has no raw traffic, so it doesn't use an IP file (-i). Use -m network or -m both"
-  [[ "$mode" != "network" || $strict -eq 0 ]] || die "--strict applies to web traffic, and network mode has none"
   [[ -z "$domains" || -f "$domains" ]] || die "domain file not found: $domains"
   [[ -z "$ips_src" || -f "$ips_src" ]] || die "IP file not found: $ips_src"
   [[ "$mode" != "network" || -z "$pin_src" ]] || die "network mode has no proxy, so it doesn't use a pinned-host file (-p). Use -m web or -m both"
@@ -752,7 +679,7 @@ cmd_up() {
     [[ -f "$up_ca" ]] || die "upstream CA file not found: $up_ca"
     check_upstream_ca "$up_ca"
   fi
-  [[ -x "$BIN_DIR/check-host.sh" && -f "$CA_DIR/ca.crt" ]] || die "this Mac isn't set up yet. Run: sudo ./install.sh"
+  [[ -f "$BIN_DIR/sbx_addon.py" && -f "$CA_DIR/ca.crt" ]] || die "this Mac isn't set up yet. Run: sudo ./install.sh"
 
   # Check every list before anything is created. A failed check creates nothing.
   # work is global on purpose: the EXIT trap runs after this function's locals are gone.
@@ -769,6 +696,19 @@ cmd_up() {
     } | awk '!seen[$0]++' > "$work/allowed"
     check_pinned_file "$pin_src" "$work/allowed" "$work/pinned"
   fi
+
+  # Environment variables for the container. Later entries win: -e beats --env-file.
+  # Values are never printed, because they may hold credentials.
+  : > "$work/env"
+  if [[ -n "$env_file_src" ]]; then
+    [[ -f "$env_file_src" ]] || die "env file not found: $env_file_src"
+    grep -vE '^[[:space:]]*(#|$)' "$env_file_src" >> "$work/env" || true
+  fi
+  if (( ${#env_args[@]} > 0 )); then printf '%s\n' "${env_args[@]}" >> "$work/env"; fi
+  local env_line
+  while IFS= read -r env_line; do
+    [[ "$env_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "environment entry must be NAME=VALUE (got a line with no name or '=')"
+  done < "$work/env"
 
   UP_NAME="$name" UP_DIR="$dir" UP_CONTAINER="sbx-$name" UP_NETWORK="sbx-$name" UP_WORK="$work" UP_EXISTED="$existed"
   trap rollback_up EXIT
@@ -790,8 +730,30 @@ cmd_up() {
     container network delete "$network" >/dev/null 2>&1 || true
   done < <(candidate_subnets)
   [[ -n "$subnet" ]] || die "no address range passed the outbound test; reboot, then run 'sandbox up' again"
-  container run -d --name "$container" --network "$network" "$SANDBOX_IMAGE" tail -f /dev/null >/dev/null \
+  # Proxy defaults for web modes, then the operator's variables. For a repeated name, the last entry wins.
+  local gateway_ip="${subnet%.0/24}.1" run_env=() kv
+  local envfile="$work/run-env"
+  : > "$envfile"
+  if [[ "$mode" != "network" ]]; then
+    printf '%s\n' "HTTP_PROXY=http://$gateway_ip:$PROXY_PORT" "http_proxy=http://$gateway_ip:$PROXY_PORT" \
+      "HTTPS_PROXY=http://$gateway_ip:$PROXY_PORT" "https_proxy=http://$gateway_ip:$PROXY_PORT" \
+      "NO_PROXY=localhost,127.0.0.1,::1" "no_proxy=localhost,127.0.0.1,::1" >> "$envfile"
+  fi
+  cat "$work/env" >> "$envfile"
+  tail -r "$envfile" | awk -F= '!seen[$1]++' | tail -r > "$envfile.final"
+  while IFS= read -r kv; do run_env+=(-e "$kv"); done < "$envfile.final"
+  # Browser data (profile, cookies, headers, logins) is shared by every tool in the sandbox, at /root/browser.
+  # It's mounted from the sandbox folder, so it survives down/start and goes into the archive on destroy.
+  # It stays out of git.
+  mkdir -p "$dir/browser" "$dir/sessions"
+  chmod 700 "$dir/browser"
+  chmod 755 "$dir/sessions"
+  local publish=()
+  if (( ui )); then publish=(-p "127.0.0.1:$UI_PORT:$UI_PORT"); fi
+  container run -d --name "$container" --network "$network" \
+    -v "$dir/browser:/root/browser" -v "$dir/sessions:/root/sessions:ro" ${publish[@]+"${publish[@]}"} ${run_env[@]+"${run_env[@]}"} "$SANDBOX_IMAGE" tail -f /dev/null >/dev/null \
     || die "failed to start container $container"
+  if (( ui )); then start_ui "$container"; fi
 
   local gateway bridge
   gateway="$(container inspect "$container" | grep -o '"ipv4Gateway" : "[^"]*"' | head -1 | cut -d'"' -f4)"
@@ -800,6 +762,9 @@ cmd_up() {
 
   mkdir -p "$dir"
   echo "$mode" > "$dir/access-mode"
+  cp "$work/env" "$dir/env"
+  chmod 600 "$dir/env"
+  if (( ui )); then echo 1 > "$dir/ui"; else rm -f "$dir/ui"; fi
 
   if [[ "$mode" != "network" ]]; then
     cp "$work/engagement" "$dir/engagement.txt"
@@ -808,7 +773,6 @@ cmd_up() {
       [[ $use_defaults -eq 1 ]] && grep -vE '^[[:space:]]*(#|$)' "$DEFAULTS_FILE"
       cat "$dir/engagement.txt"
     } | awk '!seen[$0]++' > "$dir/domains.txt"
-    if [[ $strict -eq 1 ]]; then echo "strict" > "$dir/policy"; else echo "default" > "$dir/policy"; fi
     if [[ -n "$pin_src" ]]; then cp "$work/pinned" "$dir/pinned.txt"; else rm -f "$dir/pinned.txt"; fi
     if [[ -n "$up_spec" ]]; then echo "$up_spec" > "$dir/upstream"; else rm -f "$dir/upstream"; fi
     if [[ -n "$up_ca" && "$up_ca" != "$dir/upstream-ca.pem" ]]; then store_upstream_ca "$up_ca" "$dir/upstream-ca.pem"
@@ -853,16 +817,15 @@ cmd_up() {
       ;;
   esac
   if [[ "$mode" != "network" ]]; then
-    echo "proxy on $gateway:$PROXY_PORT, policy: $(cat "$dir/policy")"
+    echo "proxy on $gateway:$PROXY_PORT"
     [[ -s "$dir/engagement.txt" ]] || echo "note: no domains were given, so no web traffic is allowed. Load some with: sandbox domain $short <file>"
     grep -qx all "$dir/domains.txt" && echo "WARNING: 'all' is set for domains. The proxy allows every hostname."
     if [[ -s "$dir/pinned.txt" ]]; then
-      echo "pinned:    $(grep -c . "$dir/pinned.txt") host(s). Under strict mode these skip the Host check"
-      [[ "$(cat "$dir/policy")" == "strict" ]] || echo "           pinned hosts only change behaviour under strict mode (--strict or: sandbox strict $short on)"
+      echo "pinned:    $(grep -c . "$dir/pinned.txt") host(s) pass through without decryption (not recorded in sessions)"
     fi
     if [[ -s "$dir/upstream" ]]; then
       echo "upstream:  web goes via $(cat "$dir/upstream") $([[ -s "$dir/upstream-ca.pem" ]] && echo "(CA trusted)" || echo "(no CA: upstream certificates must be publicly trusted)")"
-      echo "           with an upstream, every listed host is decrypted and checked by Host/SNI (strict), and pinned hosts are inspected too"
+      echo "           with an upstream, pinned hosts are decrypted too, so the upstream sees them"
       upstream_warning "$(cat "$dir/upstream")"
     fi
   fi
@@ -884,6 +847,7 @@ cmd_start() {
   [[ -n "$state" ]] || die "the container for $1 is missing; run 'sandbox destroy $1' and 'sandbox up' again"
   if [[ "$state" != "running" ]]; then
     container start "sbx-$name" >/dev/null || die "could not start the container sbx-$name"
+    if [[ -f "$dir/ui" ]]; then start_ui "sbx-$name"; fi
   fi
 
   # The sandbox's address plan must still match what was saved, or its rules would apply to the wrong place.
@@ -902,19 +866,6 @@ cmd_start() {
   echo "sandbox ${1} started (mode $mode). Check it with: sandbox verify ${1}"
 }
 
-cmd_strict() {
-  require_sandbox "${1:-}"
-  local dir="$DIR" name="$NAME" value="${2:-}" policy
-  [[ "$(cat "$dir/access-mode")" != "network" ]] || die "network mode has no web proxy, so strict mode doesn't apply"
-  case "$value" in
-    on) policy="strict" ;;
-    off) policy="default" ;;
-    *) die "usage: sandbox strict <name> on|off" ;;
-  esac
-  echo "$policy" > "$dir/policy"
-  reload_or_start_proxy "$name"
-  echo "sandbox ${1}: policy $policy"
-}
 
 cmd_pin() {
   require_sandbox "${1:-}"
@@ -934,7 +885,6 @@ cmd_pin() {
   cp "$work/pinned" "$dir/pinned.txt"
   reload_or_start_proxy "$name"
   echo "sandbox ${1}: $(grep -c . "$dir/pinned.txt" || true) pinned host(s) loaded and the proxy reloaded"
-  [[ "$(cat "$dir/policy")" == "strict" ]] || echo "note: pinned hosts only change behaviour under strict mode (sandbox strict ${1} on)"
   return 0
 }
 
@@ -1018,10 +968,10 @@ cmd_status() {
   echo "sandbox:   ${1} (project $PROJECT_NAME)"
   echo "mode:      $(cat "$dir/access-mode")"
   echo "container: ${state:-missing}"
-  if [[ -f "$dir/policy" ]]; then
-    if [[ -n "$proxy" ]]; then echo "proxy:     running (pid $proxy), policy $(cat "$dir/policy")"; else echo "proxy:     stopped"; fi
+  if [[ "$(cat "$dir/access-mode")" != "network" ]]; then
+    if [[ -n "$proxy" ]]; then echo "proxy:     running (pid $proxy)"; else echo "proxy:     stopped"; fi
     echo "domains:   $(grep -cvE '^(#|$)' "$dir/domains.txt") allowed"
-    if [[ -s "$dir/pinned.txt" ]]; then echo "pinned:    $(grep -c . "$dir/pinned.txt") host(s) skip the Host check under strict"; fi
+    if [[ -s "$dir/pinned.txt" ]]; then echo "pinned:    $(grep -c . "$dir/pinned.txt") host(s) pass through without decryption"; fi
     if [[ -s "$dir/upstream" ]]; then echo "upstream:  $(cat "$dir/upstream")$([[ -s "$dir/upstream-ca.pem" ]] && echo " (CA trusted)")"; fi
   else
     echo "proxy:     not used in this mode"
@@ -1029,6 +979,7 @@ cmd_status() {
   if [[ -f "$dir/ips.txt" ]]; then
     echo "addresses: $(grep -c . "$dir/ips.txt" || true) block(s) in ips.txt"
   fi
+  if [[ -f "$dir/env" ]]; then echo "env:       $(grep -c . "$dir/env" || true) variable(s) set (values not shown)"; fi
   echo "pf rules:  $rules loaded"
   echo "subnet:    $(json_field "$dir/state.json" subnet)  gateway: $(json_field "$dir/state.json" gateway)"
 }
@@ -1078,8 +1029,16 @@ cmd_verify() {
   }
 
   local code
-  code="$(container exec "$container" sh -c 'nc -z -w 3 8.8.8.8 53 && echo open || echo closed' 2>/dev/null || true)"
-  check "DNS is blocked" "$([[ "$code" == *closed* ]] && echo yes || echo no)"
+  # pf blocks DNS over UDP port 53. Ask a resolver directly over UDP and see whether it answers.
+  code="$(container exec "$container" sh -c "timeout 10 node -e \"const {Resolver}=require('dns');const r=new Resolver({timeout:3000,tries:1});r.setServers(['8.8.8.8']);r.resolve4('example.com',e=>console.log(e?'no-answer':'answered'))\" 2>/dev/null || echo no-answer" 2>/dev/null || true)"
+  check "DNS over UDP is blocked (8.8.8.8)" "$([[ "$code" == *no-answer* ]] && echo yes || echo no)"
+  # TCP 53 is closed by the same policy, except when ips.txt allows every address.
+  if grep -qx "0.0.0.0/0" "$dir/ips.txt" 2>/dev/null; then
+    echo "SKIP  DNS over TCP is blocked (ips.txt allows every address)"
+  else
+    code="$(container exec "$container" sh -c 'nc -z -w 3 8.8.8.8 53 && echo open || echo closed' 2>/dev/null || true)"
+    check "DNS over TCP is blocked (8.8.8.8)" "$([[ "$code" == *closed* ]] && echo yes || echo no)"
+  fi
 
   code="$(container exec "$container" sh -c "nc -z -w 3 $gateway 22 && echo open || echo closed" 2>/dev/null || true)"
   check "host SSH is unreachable from the sandbox" "$([[ "$code" == *closed* ]] && echo yes || echo no)"
@@ -1113,6 +1072,15 @@ cmd_verify() {
 
     code="$(container exec "$container" sh -c "curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT https://example.org/ | grep -i '^x-squid-error' || echo allowed" 2>/dev/null || true)"
     check "proxy refuses a host not in the list" "$([[ "$code" != *allowed* ]] && echo yes || echo no)"
+    # The SNI is the first listed host and the Host header is a second listed host. The proxy must refuse it.
+    local second_host
+    second_host="$(grep -vE '^(#|$|all$|\.)' "$dir/domains.txt" 2>/dev/null | grep -vx "$allowed_host" | head -1)"
+    if [[ -n "$allowed_host" && -n "$second_host" ]]; then
+      code="$(container exec "$container" sh -c "curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT -H 'Host: $second_host' https://$allowed_host/ | grep -i '^x-squid-error' || echo not-refused" 2>/dev/null || true)"
+      check "SNI and Host must match (SNI $allowed_host, Host $second_host)" "$([[ "$(printf '%s' "$code" | tr 'A-Z' 'a-z')" == *x-squid-error* ]] && echo yes || echo no)"
+    else
+      echo "SKIP  SNI and Host must match (needs two listed hosts)"
+    fi
 
     check "proxy is running" "$([[ -n "$(proxy_pids "$name")" ]] && echo yes || echo no)"
   fi
@@ -1154,6 +1122,7 @@ cmd_destroy() {
   [[ -n "$(proxy_pids "$name")" ]] && leftovers+=("proxy process")
   [[ -n "$(pf_show "$name")" ]] && leftovers+=("pf rules")
 
+  rm -rf "$dir/mitm"
   local archives
   archives="$(dirname "$SB_BASE")/archive"
   archive="$archives/$name-$(date +%Y%m%d-%H%M%S)"
@@ -1225,21 +1194,24 @@ Once per project folder:
   init                                        make this folder a sandbox project
 
 Inside a project (the project is found from the current folder):
-  up <name> [-m web|network|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port> [--upstream-ca <pem>]] [--strict] [--no-defaults]
+  up <name> [-m web|network|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port> [--upstream-ca <pem>]] [--no-defaults]
         -m   mode, default both
         -d   domain file (web and both). Optional: an empty list is created if it's missing
         -i   IP file (network and both). Optional: an empty list is created if it's missing
         -p   pinned-host file (web and both). Hosts must also be in the domain list
         --upstream <host:port>    send web through another proxy, such as Burp (web and both)
         --upstream-ca <pem>       CA that the upstream proxy signs with, PEM or DER (needs --upstream)
-        --strict, --no-defaults   web and both only
+        -e NAME=VALUE             environment variable for the sandbox (repeatable). Values are not printed
+        --env-file <file>         NAME=VALUE lines. -e entries override it
+        --ui                      start the sandbox interface on 127.0.0.1:6080 (no password) for manual logins
+        --no-defaults             web and both only
   domain <name> <file>                        replace the domain list and reload the proxy (web and both)
   ip <name> <file>                            replace the IP list and reload the firewall (network and both)
-  status <name>                               show mode, container, proxy, rules and policy
+  status <name>                               show mode, container, proxy and rules
   verify <name>                               run the containment checks (PASS/FAIL)
   shell <name>                                open a shell inside the sandbox
-  strict <name> on|off                        strict Host/SNI checking (web and both)
-  pin <name> <file>|none                      hosts that skip the Host check under strict (web and both)
+  ui <name>                                   open the sandbox interface in a browser (needs up --ui)
+  pin <name> <file>|none                      hosts that pass through without decryption (web and both)
   upstream <name> <host:port>|none [<ca.pem>] send web through another proxy, such as Burp (web and both)
   logs <name> [-f]                            web decisions (proxy) and network decisions (pf)
   down <name>                                 stop the container, proxy and rules (keeps state)
@@ -1252,8 +1224,12 @@ Anywhere:
 An empty domain or IP file allows nothing for that kind of traffic. A line reading 'all'
 allows every hostname (domains) or every address (IPs). Use it deliberately.
 
-Pinned hosts skip the Host check under strict mode, so use them only for clients that
-reject decrypted traffic. Each one must also be in the domain list.
+Pinned hosts pass through without decryption, so they skip the Host check and aren't recorded
+in the sessions file. Use them only for clients that reject decrypted traffic. Each one must
+also be in the domain list.
+
+Every listed host is decrypted, and its headers and cookies are recorded in
+sessions/sessions.json (one block per domain). The folder is mounted read-only at /root/sessions.
 
 With an upstream proxy set, every listed host is decrypted and checked by Host/SNI, and
 pinned hosts are inspected too. The upstream must be listening, or web requests fail.
@@ -1274,7 +1250,6 @@ case "${1:-}" in
   up) ensure_container_service; resolve_project; shift; cmd_up "$@" ;;
   domain) ensure_container_service; resolve_project; cmd_domain "${2:-}" "${3:-}" ;;
   ip) ensure_container_service; resolve_project; cmd_ip "${2:-}" "${3:-}" ;;
-  strict) ensure_container_service; resolve_project; cmd_strict "${2:-}" "${3:-}" ;;
   pin) ensure_container_service; resolve_project; cmd_pin "${2:-}" "${3:-}" ;;
   upstream) ensure_container_service; resolve_project; cmd_upstream "${2:-}" "${3:-}" "${4:-}" ;;
   verify) ensure_container_service; resolve_project; cmd_verify "${2:-}" ;;
@@ -1284,6 +1259,7 @@ case "${1:-}" in
   start) ensure_container_service; resolve_project; cmd_start "${2:-}" ;;
   destroy) ensure_container_service; resolve_project; cmd_destroy "${2:-}" ;;
   shell) ensure_container_service; resolve_project; cmd_shell "${2:-}" ;;
+  ui) resolve_project; cmd_ui "${2:-}" ;;
   ""|-h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

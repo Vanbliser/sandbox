@@ -1,8 +1,8 @@
 # sandbox
 
-The sandbox tool is specifically built to run AI pentesting agents in isolated environments on your Mac machine. It is build with the Apple `container` microVM and a host-side firewall.
+The sandbox tool is specifically built to run AI pentesting agents in isolated environments on your Mac machine. It is built with the Apple `container` microVM and a host-side firewall.
 
-Every sandbox logs what it tried, and you can cut its network or stop it at any time
+Every sandbox logs what it tried, and you can cut its network or stop it at any time.
 
 
 ## The components
@@ -15,24 +15,22 @@ Every sandbox logs what it tried, and you can cut its network or stop it at any 
 
 **`pflog0` and the network log.** `pflog0` is macOS's interface for pf's log records. The helper creates it when it's missing. Each rule that matters has the `log` keyword, so every allow and block is recorded. A root-owned `tcpdump` reads them and writes the sandbox's `pflog.txt`. `sandbox logs` groups them into one line per flow.
 
-**Squid.** The web proxy, installed with Homebrew. The script generates one configuration per sandbox and runs one Squid process for each. It listens on the sandbox's gateway address, on port 3128, and checks each hostname against the sandbox's domain list. Connections to listed hosts pass through unchanged. In strict mode, Squid decrypts them and checks the Host header.
+**mitmproxy.** The web proxy. One process per sandbox on the sandbox's gateway. Setup installs it with Homebrew, and the sandbox's own CA signs the certificates.
 
-**The sandbox CA.** A certificate authority created on your Mac by `setup`. Squid uses it to present certificates in strict mode, and the sandbox image trusts it. The private key never leaves `~/.sandbox/ca/`.
+**The sandbox CA.** A certificate authority created on your Mac by `setup`. The proxy uses it to sign the certificates it presents, and the sandbox image trusts it. The private key stays in `~/.sandbox/ca/`. Each sandbox's proxy also keeps a copy in its `mitm/` folder, which `destroy` deletes.
 
-**The image.** A Linux image built by `setup` with `container build`. It contains curl, Node, npm and nmap. It trusts the sandbox CA and the roots exported from your Mac's keychains, which is how a sandbox trusts the same sites your Mac does.
+**The image.** An Ubuntu 24.04, with Playwright 1.59.1 and its Chromium. Setup downloads these on the Mac into `~/.sandbox/image/pw`, so the image build doesn't depend on npm. The image contains curl, Node, npm and nmap. It trusts the sandbox CA and the roots exported from your Mac's keychains, which is how a sandbox trusts the same sites your Mac does.
 
 **The privileged helper** (`/usr/local/libexec/sandbox-pf`). The only root-owned part of the tool. The script calls it through sudo to load, show and flush the pf anchor, and to start and stop the network log. It validates every argument, including the paths of log files. It builds the rules itself and never accepts rule text.
 
 **The sudo rule** (`/etc/sudoers.d/sandbox`). Lets your user run the helper's `load`, `show`, `capture-start` and `capture-stop` without a password. `flush` still asks for your password.
 
-**The Host-check helper** (`~/.sandbox/bin/check-host.sh`). Squid calls it for each request in strict mode. It compares the Host header and TLS name against the sandbox's domain list, and in default mode it checks the destination address against the names' DNS answers.
-
-**Standard tools.** `dig` resolves names for the Host-check helper. `python3` converts IP ranges to CIDR blocks. `ifconfig`, `netstat` and `pgrep` find free subnets, bridges and proxy processes. `security` exports the keychain roots. `nc`, `curl` and `ping` run the containment checks.
+**Standard tools.** `python3` converts IP ranges to CIDR blocks. `ifconfig`, `netstat` and `pgrep` find free subnets, bridges and proxy processes. `security` exports the keychain roots. `nc` and `curl` run the containment checks. Setup checks for `dig`.
 
 ## Requirements
 
 - macOS on Apple silicon, with Apple's `container` CLI from <https://github.com/apple/container/releases>
-- Homebrew (<https://brew.sh>). Setup installs `squid` through it, after asking
+- Homebrew (<https://brew.sh>). Setup installs `mitmproxy` through it, after asking
 - The Xcode Command Line Tools, for `python3` (`xcode-select --install`)
 - An administrator account. The tool needs root for pf rules, so the installer needs `sudo`. Without it, `up` fails, and `verify` reports the pf rules as missing
 
@@ -48,7 +46,7 @@ sudo ./install.sh     # installs the firewall helper, the command, and the Mac-l
 
 `sudo ./install.sh` asks for your password once. It sets up the CA and the image as your user, so the files are yours. It asks before it changes your shell profile. It detects your login shell and writes the PATH line to the matching file: `~/.zshrc` for zsh, `~/.bash_profile` for bash, `~/.config/fish/config.fish` for fish, and `~/.profile` for anything else. When it has changed a file, it prints the `source` command for that shell.
 
-The CA's private key stays in `~/.sandbox/ca/`, with owner-only permissions.
+The CA's private key stays in `~/.sandbox/ca/`, with owner-only permissions. The proxy keeps a copy in each sandbox's `mitm/` folder, which `destroy` deletes.
 
 To remove everything the installer put in place: `sudo ./install.sh --uninstall`. This leaves `~/.sandbox` and your projects alone.
 
@@ -59,7 +57,31 @@ pf rules need root. Rather than give the tool full sudo, the installer adds:
 - `/usr/local/libexec/sandbox-pf`, a root-owned helper. It accepts only `load`, `show`, `flush`, `capture-start` and `capture-stop`, and only for a `com.apple/sandbox-*` anchor. It builds the rules itself from validated values, and it never accepts rule text.
 - `/etc/sudoers.d/sandbox`, which lets your user run `load`, `show`, `capture-start` and `capture-stop` without a password.
 
-`flush` isn't in that rule. Taking down a sandbox's containment, through `down` or `destroy`, asks for your password.
+`flush` isn't in that rule, so it needs your password. `down` and `destroy` run it and hide any error. If the rules are still there afterwards, `destroy` reports them. Clear them with `sudo /usr/local/libexec/sandbox-pf flush <project>-<name>`.
+
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `sandbox setup` | Once per Mac: create the CA and build the image. The installer runs it for you |
+| `sandbox init` | In a folder: make it a sandbox project |
+| `sandbox up <name> [-m web\|network\|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port>] [--upstream-ca <pem\|der>] [--ui] [--no-defaults] [-e NAME=VALUE \| --env-file <file>]` | Create a sandbox. Mode defaults to `both`. Missing lists are created empty |
+| `sandbox domain <name> <file>` | Replace the domain list and reload the proxy (web and both) |
+| `sandbox ip <name> <file>` | Replace the IP list and reload the firewall (network and both) |
+| `sandbox pin <name> <file>\|none` | Replace the pinned list on a running sandbox and reloads the proxy. `none` clears the list. |
+| `sandbox status <name>` | Show mode, container, proxy and rules |
+| `sandbox verify <name>` | Run the containment checks, PASS or FAIL for each |
+| `sandbox shell <name>` | Open a shell inside the sandbox |
+| `sandbox ui <name>` | Open the sandbox interface in a browser (needs `up --ui`) |
+| `sandbox logs <name> [-f]` | Web decisions (proxy) and network decisions (pf), or follow them live. It shows only what the sandbox sent or tried to send |
+| `sandbox down <name>` | Stop the container, proxy and rules. Keeps the state |
+| `sandbox upstream <name> [<host:port> <ca_file> \| none]` | Sends web traffic through an upstream proxy, such as Burp. The CA file may be PEM or DER. `none` removes it |
+| `sandbox start <name>` | brings back a sandbox that sandbox down has stopped. reusing the kept state |
+| `sandbox destroy <name>` | Remove the sandbox. Archives its logs and settings in the project's `.sandbox/archive/` |
+| `sandbox list` | List every sandbox in every project on this Mac |
+
+Sandbox names are lowercase letters, digits and hyphens. The project name and the sandbox name together must be 50 characters or fewer.
 
 
 ## How the workflow fits together
@@ -79,9 +101,11 @@ There are three levels:
       webapp-app1/               one sandbox
         engagement.txt           your domains (committed)
         ips-source.txt           your IP list (committed)
-        access-mode, policy, defaults   settings (committed)
+        pinned.txt, upstream, upstream-ca.pem, ui, access-mode, defaults   settings (committed)
         domains.txt, ips.txt     generated (ignored)
         state.json, logs, ...    runtime (ignored)
+        browser/, sessions/      browser data and captured sessions (ignored)
+        mitm/, env               proxy CA copy and environment values (ignored)
     archive/                     destroyed sandboxes (ignored)
     failed/                      sandboxes that failed to start (ignored)
 ```
@@ -114,9 +138,9 @@ sandbox up app1 -d my-domains.txt -i my-ips.txt
 Each sandbox has two lists you control:
 
 - **`domains.txt`**: which websites the sandbox may reach, through a checking proxy
-- **`ips.txt`**: which addresses it may reach with network tools (`ping`, `traceroute`, `nmap`) that make direct conections
+- **`ips.txt`**: which addresses it may reach with network tools (`ping`, `traceroute`, `nmap`) that make direct connections
 
-Or leave out the files and load them afterwards. In such case, `sandbox up` creates empty my-domains.txt and my-ips.lists:
+Or leave out the files and load them afterwards. Missing lists are created empty inside the sandbox's folder, and you load your own files afterwards:
 
 ```bash
 sandbox up app1
@@ -207,7 +231,6 @@ app.example.com
 | `ping`, `traceroute`, non-web TCP/UDP | Blocked | To listed addresses | To listed addresses |
 | `nmap` on web ports (80, 443) | Blocked | To listed addresses | Blocked, unless both lists are `all` |
 | Logging | Proxy log | pf network log | Both logs |
-| `--strict` | Yes | Not applicable | Yes |
 
 ## How the two lists combine
 
@@ -224,31 +247,13 @@ Two things are always blocked, whatever the lists say: DNS (port 53), and this M
 
 The `all` keyword works in both files. It means "every hostname" in `domains.txt` and "every address" in `ips.txt`. Use it deliberately. `sandbox up` prints a warning whenever `all` is set, and says what it opens.
 
-## Strict mode
-
-By default, web traffic passes through without decryption, so the proxy checks only the hostname in the connection request. Strict mode decrypts each connection and requires the TLS name to match the Host header. A request can't reach a site it wasn't approved for, even on a shared host.
-
-```bash
-sandbox up app1 -m web -d my-domains.txt --strict   # start in strict mode
-sandbox strict app1 on                              # switch on a running sandbox
-sandbox strict app1 off                             # switch back
-```
-
-Changes apply to new connections.
-
-
-Written for: operators who use the sandbox tool and will read this in the README.
 
 ## Pinned hosts
 
-Some clients pin their certificates, so strict mode breaks them. Strict mode decrypts web traffic and checks that the SNI matches the Host header. A pinned client rejects the decrypted connection, so the request fails. Pinned hosts are the exception: Squid passes their traffic through without decrypting it, so the client's certificate check still works.
-
-**What you get:** a pinned host works under strict mode, but its traffic is not checked against the Host header. Only pin hosts you already trust to be allowed.
-
-**Where it's set:** a plain list file, `pinned.txt`, one host per line, in the sandbox folder.
+Pinned hosts pass through without decryption. They are not checked and not recorded. Each pinned host must also be on the domain list.
 
 ```
-sandbox up <name> -d domains.txt -p pinned.txt --strict
+sandbox up <name> -d domains.txt -p pinned.txt
 sandbox pin <name> <file>
 sandbox pin <name> none
 ```
@@ -260,7 +265,6 @@ sandbox pin <name> none
 **Rules:**
 - Each pinned host must already be in the domain list. A host that isn't allowed is refused, and nothing changes.
 - `all` can't be pinned. List the hosts you need.
-- Pinned hosts have no effect unless strict mode is on. `up` and `pin` warn you when it's off.
 - If `domain` removes a pinned host from the list, that host is dropped from `pinned.txt` and the command says so.
 - `status` shows the pinned count. `pinned.txt` is a committed list, so it travels with the project like `engagement.txt`.
 
@@ -279,22 +283,9 @@ example.com
 api.example.com
 ```
 
-**Example session:**
-```
-sandbox up pintest -d domains.txt -p pinned.txt --strict
-sandbox status pintest        # shows: pinned: 2 host(s) skip the Host check under strict
-sandbox pin pintest none      # clear the pinned list
-sandbox pin pintest pinned.txt
-```
+## Environment variables
 
-Refused input, for example a host that isn't in the domain list:
-
-```
-sandbox pin pintest bad-pinned.txt
-sandbox: pinned file bad-pinned.txt: 'evil.example.io' is not in the domain list. Pin only allowed hosts
-```
-
-**Trade-off:** pinned hosts skip the Host/SNI check. A request to a pinned host is allowed on the name in its CONNECT line, not on the name in the decrypted request. Keep the list short, and only list hosts whose addresses you trust.
+`up -e NAME=VALUE` (repeatable) and `up --env-file <file>`. In web modes the sandbox gets HTTP_PROXY, HTTPS_PROXY, and NO_PROXY automatically. Values are stored in the sandbox folder, owner-only, and never printed.
 
 
 ## What `sandbox up` does, in order
@@ -304,27 +295,17 @@ sandbox: pinned file bad-pinned.txt: 'evil.example.io' is not in the domain list
 3. Tries each free range in `192.168.200.0/24` to `192.168.250.0/24`. For each one it creates the network, then runs a short outbound test from a container, before any firewall rules exist. A range that fails is removed and the next one is tried. If none pass, `up` stops and says so.
 4. Starts the container, reads its gateway address, and finds its bridge.
 5. Writes the mode, the lists and the settings into the sandbox's folder in the project. Missing lists are written empty.
-6. In web and both modes, writes Squid's configuration and starts Squid on the gateway address.
+6. In web and both modes, writes the proxy's settings and starts mitmproxy on the gateway address.
 7. Loads the pf rules through the privileged helper.
 8. In network and both modes, starts the network log.
 9. Prints the mode note and any warnings.
 
-If any step fails, the rollback stops Squid and the network log, flushes the pf rules, removes the container and network, and moves the sandbox's folder to the project's `.sandbox/failed/` (or keeps the lists, if they came from a clone).
+If any step fails, the rollback stops the proxy and the network log, flushes the pf rules, removes the container and network, and moves the sandbox's folder to the project's `.sandbox/failed/` (or keeps the lists, if they came from a clone).
 
 
-This is the expected behavior, not a new bug. The anchor flush runs through `sudo`, and the sudoers file only grants NOPASSWD for load, show, and capture. Flush needs your password, and `destroy` runs it without a prompt. The flush failure is suppressed, but `destroy` then reports it, which is what happened. I can't enter your password, so the leftover rules are still in the anchor.
+## Upstream proxy
 
-Here is the cleanup for you to run:
-
-```
-sudo /usr/local/libexec/sandbox-pf flush monnify-upt
-```
-
-The next `up` with that name replaces the anchor's rules, so the leftover can't affect a new sandbox.
-
-## Upstream proxy:
-
-**What it does:** When set, Squid sends web traffic to an upstream proxy, such as Burp, rather than straight out. Raw IP traffic is unaffected.
+**What it does:** When set, mitmproxy sends web traffic to an upstream proxy, such as Burp, rather than straight out. The upstream's CA is trusted for that leg. The CA may be PEM or DER.
 
 **Commands**
 ```
@@ -333,36 +314,16 @@ sandbox upstream <name> 127.0.0.1:8080 ~/Downloads/cacert.der
 sandbox upstream <name> none
 ```
 
-Squid needs PEM, so it is concerted to PEM when it stores the file.
-
-- `--upstream-ca` adds Burp's CA to the trust list for the upstream leg. Without it, the upstream's certificates must be publicly trusted.
+- `--upstream-ca` adds the upstream's CA to the trust list for the upstream leg. Without it, the upstream's certificates must be trusted by this Mac.
 - `status` shows the upstream and whether a CA is trusted. `up` and `upstream` print the same.
-- Upstream settings are committed with the project,.
+- Upstream settings are committed with the project.
 
+**Headers and cookies** are recorded per domain in sessions/sessions.json. This happens for every allowed request, with no flag needed. The folder is mounted read-only in the sandbox at /root/sessions. The file holds credentials in plain text, so keep it out of git.
 
-## Commands
+**Browser folder and interface**
 
-| Command | What it does |
-|---|---|
-| `sandbox setup` | Once per Mac: create the CA and build the image. The installer runs it for you |
-| `sandbox init` | In a folder: make it a sandbox project |
-| `sandbox up <name> [-m web\|network\|both] [-d <file>] [-i <file>] [-p <filed] [--strict] [--upstream <ip:port>] [--upstream-ca <path_to_DER_CA>][--no-defaults]` | Create a sandbox. Mode defaults to `both`. Missing lists are created empty |
-| `sandbox domain <name> <file>` | Replace the domain list and reload the proxy (web and both) |
-| `sandbox ip <name> <file>` | Replace the IP list and reload the firewall (network and both) |
-| `sandbox pin <name> <file>\|none` | Replace the pinned list on a running sandbox and reloads the proxy. `none` clears the list. |
-| `sandbox status <name>` | Show mode, container, proxy, rules and policy |
-| `sandbox verify <name>` | Run the containment checks, an upstream proxy check (e.g Burpsuite), PASS or FAIL for each |
-| `sandbox shell <name>` | Open a shell inside the sandbox |
-| `sandbox strict <name> on\|off` | Switch strict Host/SNI checking (web and both) |
-| `sandbox logs <name> [-f]` | Web decisions (proxy) and network decisions (pf), or follow them live. It shows only what the sandbox sent or tried to send |
-| `sandbox down <name>` | Stop the container, proxy and rules. Keeps the state |
-| `sandbox upstream <name> [<upstream_ip:port> <DER_ca_file> \| none]` | Sends web traffic to an upstream proxy, such as Burp. `none` unsets it |
-| `sandbox start <name>` | brings back a sandbox that sandbox down has stopped. reusing the kept state |
-| `sandbox destroy <name>` | Remove the sandbox. Archives its logs and settings in the project's `.sandbox/archive/` |
-| `sandbox list` | List every sandbox in every project on this Mac |
-
-Sandbox names are lowercase letters, digits and hyphens. The project name and the sandbox name together must be 50 characters or fewer.
-
+- browser/ is mounted read-write at /root/browser. Any tool in the sandbox can store its data there. It survives down and start, and destroy archives it.
+- up --ui starts a web interface on 127.0.0.1:6080 (no password). ui <name> opens it. Its first pane is the sandbox desktop, where Chromium runs.
 
 ## What's enforced
 
@@ -370,12 +331,12 @@ Sandbox names are lowercase letters, digits and hyphens. The project name and th
 |---|---|
 | Isolation | Each sandbox is an Apple `container` microVM with its own kernel and network |
 | Default deny | pf blocks all traffic from the sandbox, except what its lists allow |
-| Proxy path | Web requests go to Squid, which checks each hostname against `domains.txt` |
+| Proxy path | Web requests go to mitmproxy, which checks each request against `domains.txt` |
 | Host protection | The sandbox can't reach this Mac's services, including SSH |
 | DNS | Blocked for the sandbox. Names are resolved on the host, by the proxy |
 | Visibility | Web decisions are logged by the proxy (`access.log`). Network decisions are logged by pf (`pflog.txt`), and `sandbox logs` groups them by flow |
 | Kill switch | `down` cuts the network and stops the container. `destroy` removes everything |
-| Strict mode | Decrypts HTTPS and requires the TLS name to match the Host header |
+| Host and SNI | Refused at CONNECT if the name isn't listed. Refused at the handshake if the SNI isn't listed or doesn't match the CONNECT name. Refused per request if the Host doesn't match the SNI or isn't listed |
 
 ## What's not covered
 
@@ -383,12 +344,13 @@ Read these before relying on a sandbox:
 
 - **Raw traffic isn't checked by name.** Anything sent to a listed address goes straight there, so the proxy never sees it.
 - **Web ports on raw addresses bypass the proxy when both lists are `all`.** Tools can then reach any web server directly, with no domain check.
-- **Other HTTP services bypass the check.** A web app on port 8080 or 8000 isn't a web port in the rules, so it goes raw.
+- **Raw traffic to a listed address bypasses the proxy on any port.** Web traffic sent through the proxy is checked by name on any port, including 8080. But a tool that connects directly to a listed IP on port 8080 or 8000 isn't checked by name.
 - **Shared-hosting addresses serve other sites.** A listed address on a CDN can serve sites you never approved, and raw traffic reaches them too.
-- **Pinned clients.** Trust and pinning are separate. Direct-IP connections are always decrypted, so pinned clients can fail on those.
+- **Pinned clients.** Pinned hosts pass through undecrypted, so their certificates work but their traffic isn't recorded. Other hosts are decrypted, so a client that pins a certificate and isn't on the pinned list will fail there.
 - **Trust follows the Mac.** `setup` copies the trust roots from your Mac's keychains into the sandbox's image.
 - **Credentials.** Logins and API keys live inside the sandbox. An agent that reads them can send them to any reachable host. Use test accounts, and keep the lists tight.
 - **Port restrictions on the proxy.** The domain list matches hostnames, not ports.
+- **The interface has no password.** While a sandbox runs with `--ui`, any process on your Mac can reach `127.0.0.1:6080`.
 - **Anything inside an allowed host.** Allowed sites are reachable in full. Scope is still the operator's job.
 
 
@@ -400,13 +362,13 @@ Read these before relying on a sandbox:
 - **`up` or `destroy` says a network won't delete:** the container service has a stale record for it, which `sandbox` can't remove. Reboot your Mac, then check with `container network list`.
 - **A pf rule change didn't take effect:** the helper may be out of date. Run `sudo ./install.sh` again.
 - **`sandbox` says this folder isn't a project:** run `sandbox init` in the project folder first, or `cd` into the project.
-- **`sandbox shell` says the sandbox is stopped:** there's no start command yet. Recreate the sandbox with `sandbox destroy` and `sandbox up`.
-- **Stray proxy processes:** `pgrep -fl squid` lists them. `sandbox destroy` stops the proxy for its sandbox.
+- **A sandbox is stopped:** run `sandbox start <name>` to bring it back with its saved settings.
+- **Stray proxy processes:** `pgrep -fl mitmdump` lists them. `sandbox destroy` stops the proxy for its sandbox.
 
 ## For developers
 
 The tool is one Bash script, `sandbox`, with a privileged helper, `privileged/sandbox-pf`. There's no daemon. Each command runs to completion. Per-machine state is in `~/.sandbox/`, and per-project state is in each project's `.sandbox/`.
 
-- Check syntax after every change: `bash -n sandbox && bash -n privileged/sandbox-pf && bash -n install.sh`
+- Check syntax after every change: `bash -n sandbox && bash -n privileged/sandbox-pf && bash -n install.sh && python3 -m py_compile addon/sbx_addon.py`
 - Test each change end to end: `up`, `verify`, the traffic checks, then `destroy`. There are no automated tests yet.
 - After changing the helper, reinstall it with `sudo ./install.sh`.
