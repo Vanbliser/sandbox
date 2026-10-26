@@ -854,7 +854,16 @@ cmd_start() {
   local now
   now="$(container inspect "sbx-$name" | grep -o '"ipv4Gateway" : "[^"]*"' | head -1 | cut -d'"' -f4)"
   [[ "$now" == "$gateway" ]] || die "the sandbox's gateway changed ($gateway -> ${now:-none}). Run 'sandbox destroy $1' and 'sandbox up' again"
-  [[ "$(find_bridge "$gateway")" == "$bridge" ]] || die "the sandbox's bridge changed. Run 'sandbox destroy $1' and 'sandbox up' again"
+  # macOS names each bridge when it comes up, so a reboot can rename this sandbox's bridge (bridge101 -> bridge100).
+  # The gateway address is what identifies the sandbox, so take the bridge from it and save the new name before
+  # the rules load. The rules are built from the saved name.
+  local current_bridge
+  current_bridge="$(find_bridge "$gateway")"
+  if [[ "$current_bridge" != "$bridge" ]]; then
+    echo "macOS renamed the sandbox's bridge ($bridge -> $current_bridge). Saving the new name."
+    sed -i '' "s/\"bridge\": \"$bridge\"/\"bridge\": \"$current_bridge\"/" "$dir/state.json"
+    bridge="$current_bridge"
+  fi
 
   if [[ "$mode" != "network" ]]; then
     reload_or_start_proxy "$name"
@@ -1070,8 +1079,13 @@ cmd_verify() {
       echo "SKIP  proxy allows a listed host (no domains are listed)"
     fi
 
-    code="$(container exec "$container" sh -c "curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT https://example.org/ | grep -i '^x-squid-error' || echo allowed" 2>/dev/null || true)"
-    check "proxy refuses a host not in the list" "$([[ "$code" != *allowed* ]] && echo yes || echo no)"
+    # With 'all' in the domain list, every host is allowed, so there's no unlisted host to test.
+    if grep -qx all "$dir/domains.txt" 2>/dev/null; then
+      echo "SKIP  proxy refuses a host not in the list (domains.txt allows every host)"
+    else
+      code="$(container exec "$container" sh -c "curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT https://example.org/ | grep -i '^x-squid-error' || echo allowed" 2>/dev/null || true)"
+      check "proxy refuses a host not in the list" "$([[ "$code" != *allowed* ]] && echo yes || echo no)"
+    fi
     # The SNI is the first listed host and the Host header is a second listed host. The proxy must refuse it.
     local second_host
     second_host="$(grep -vE '^(#|$|all$|\.)' "$dir/domains.txt" 2>/dev/null | grep -vx "$allowed_host" | head -1)"
