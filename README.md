@@ -9,13 +9,13 @@ Every sandbox logs what it tried, and you can cut its network or stop it at any 
 
 **Apple `container` CLI.** Runs the sandbox as a lightweight virtual machine with its own kernel. The script creates a network per sandbox, starts the sandbox, reads its gateway address, and runs commands in it.
 
-**pf (macOS packet filter).** The firewall in the macOS kernel. It decides which packets leave the sandbox's bridge. Every rule the script writes lives in its own anchor, `com.apple/sandbox-<name>`, so it never touches your system rules or your own traffic.
+**pf (macOS packet filter).** The firewall in the macOS kernel. It decides which packets leave the sandbox's bridge. Every rule the script writes lives in its own anchor, `com.apple/sandbox-<name>`, one per sandbox or group, so it never touches your system rules or your own traffic.
 
 **The bridge.** A virtual network interface on the host, one per sandbox. The sandbox's traffic enters the host through it, which is where pf filters it. The script finds the bridge by the gateway address, because macOS reuses bridge names.
 
 **`pflog0` and the network log.** `pflog0` is macOS's interface for pf's log records. The helper creates it when it's missing. Each rule that matters has the `log` keyword, so every allow and block is recorded. A root-owned `tcpdump` reads them and writes the sandbox's `pflog.txt`. `sandbox logs` groups them into one line per flow.
 
-**mitmproxy.** The web proxy. One process per sandbox on the sandbox's gateway. Setup installs it with Homebrew, and the sandbox's own CA signs the certificates.
+**mitmproxy.** The web proxy. One process per sandbox, or per group, on its gateway. The members of a group share its proxy. Setup installs it with Homebrew, and the sandbox's own CA signs the certificates.
 
 **The sandbox CA.** A certificate authority created on your Mac by `setup`. The proxy uses it to sign the certificates it presents, and the sandbox image trusts it. The private key stays in `~/.sandbox/ca/`. Each sandbox's proxy also keeps a copy in its `mitm/` folder, which `destroy` deletes.
 
@@ -88,7 +88,7 @@ If the helper is out of date, `up` and `start` fail, or the firewall rules don't
 |---|---|
 | `sandbox setup` | Once per Mac: create the CA and build the image. The installer runs it for you |
 | `sandbox init` | In a folder: make it a sandbox project |
-| `sandbox up <name> [-m web\|network\|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port>] [--upstream-ca <pem\|der>] [--ui] [--no-defaults] [-e NAME=VALUE \| --env-file <file>]` | Create a sandbox. Mode defaults to `both`. Missing lists are created empty |
+| `sandbox up <name> [-m web\|network\|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port>] [--upstream-ca <pem\|der>] [--group <group>] [--ui] [--no-defaults] [-e NAME=VALUE \| --env-file <file>]` | Create a sandbox. Mode defaults to `both`. Missing lists are created empty. With `--group`, it joins that group instead of getting its own network. If the group doesn't exist, it's created from the lists given here, with a note |
 | `sandbox domain <name> <file>` | Replace the domain list and reload the proxy (web and both) |
 | `sandbox ip <name> <file>` | Replace the IP list and reload the firewall (network and both) |
 | `sandbox pin <name> <file>\|none` | Replace the pinned list on a running sandbox and reloads the proxy. `none` clears the list. |
@@ -97,11 +97,21 @@ If the helper is out of date, `up` and `start` fail, or the firewall rules don't
 | `sandbox shell <name>` | Open a shell inside the sandbox |
 | `sandbox ui <name>` | Open the sandbox interface in a browser (needs `up --ui`) |
 | `sandbox logs <name> [-f]` | Web decisions (proxy) and network decisions (pf), or follow them live. It shows only what the sandbox sent or tried to send |
-| `sandbox down <name>` | Stop the container, proxy and rules. Keeps the state |
+| `sandbox down <name>` | Stop the container, proxy and rules. Keeps the state. For a group member, stops only its container |
 | `sandbox upstream <name> [<host:port> <ca_file> \| none]` | Sends web traffic through an upstream proxy, such as Burp. The CA file may be PEM or DER. `none` removes it |
 | `sandbox start <name>` | brings back a sandbox that sandbox down has stopped. reusing the kept state |
-| `sandbox destroy <name>` | Remove the sandbox. Archives its logs and settings in the project's `.sandbox/archive/` |
+| `sandbox destroy <name>` | Remove the sandbox. Archives its logs and settings in the project's `.sandbox/archive/`. For a group member, also removes it from the group |
 | `sandbox list` | List every sandbox in every project on this Mac |
+| `sandbox group create <group> [-d <file>] [-i <file>] [-p <file>] [--no-defaults]` | Create a group in this project: a shared network, proxy and lists for its members. A group can be created empty |
+| `sandbox group list` | List every group on this Mac, with its project, subnet and member count |
+| `sandbox group <group> list` | List the members of a group, with their state and address |
+| `sandbox group <group> domain <file>` | Replace the domain list for every member. The proxy picks it up without a restart |
+| `sandbox group <group> ip <file>` | Replace the address list for every member, and reload the firewall |
+| `sandbox group <group> status` | Show the group's network, hub, proxy, lists and members |
+| `sandbox group <group> verify` | Check the group, then every running member. A stopped member is skipped with a note |
+| `sandbox group <group> down` | Stop every member, the group's proxy and its firewall rules. Keeps the state |
+| `sandbox group <group> start` | Start the group's hub, proxy and firewall rules, then start every member |
+| `sandbox group delete <group>` | Delete a group that has no members. Its settings and logs are archived in the project's `.sandbox/archive/` |
 
 Sandbox names are lowercase letters, digits and hyphens. The project name and the sandbox name together must be 50 characters or fewer.
 
@@ -128,9 +138,15 @@ There are three levels:
         state.json, logs, ...    runtime (ignored)
         browser/, sessions/      browser data and captured sessions (ignored)
         mitm/, env               proxy CA copy and environment values (ignored)
-    archive/                     destroyed sandboxes (ignored)
+    groups/
+      myteam/                    one group
+        engagement.txt, defaults, pinned.txt   lists and settings (committed)
+        domains.txt, ips.txt, members.json, state.json, logs   runtime (ignored)
+        sessions/, mitm/         per-member sessions and the proxy's CA copy (ignored)
+    archive/                     destroyed sandboxes and deleted groups (ignored)
     failed/                      sandboxes that failed to start (ignored)
 ```
+Projects created before groups existed need these lines added to `.sandbox/.gitignore` by hand: `groups/*/members.json`, `groups/*/state.json`, `groups/*/domains.txt`, `groups/*/ips.txt`, `groups/*/*.log`, `groups/*/*.out`, `groups/*/*.pid`, `groups/*/mitm/` and `groups/*/sessions/`.
 
 ## Start a project
 
@@ -218,6 +234,78 @@ sandbox destroy app1    # removes the sandbox and archives its logs and settings
 ```bash
 sandbox list            # every sandbox in every project, with its project name
 ```
+
+## Groups
+
+A group is a shared network for sandboxes in one project. Its members share one set of lists, one proxy and one firewall, and they can reach each other directly. Use a group when several sandboxes should work together, for example an agent and the service it tests. Use separate sandboxes when they must stay isolated.
+
+A project can have several groups, each with its own name, and ungrouped sandboxes can exist alongside them. A group and a sandbox in the same project can't share a name.
+
+### Create a group
+
+```bash
+sandbox group create team -d my-domains.txt -i my-ips.txt
+sandbox group create empty            # no lists: nothing is allowed until you load some
+```
+
+`group create` takes the same list options as `up`, with the same checks, and the same defaults unless you pass `--no-defaults`.
+
+### Add members
+
+```bash
+sandbox up app1 --group team
+```
+
+A member takes its group's network and lists. It can't have lists, an upstream proxy or `--no-defaults` of its own. If the group doesn't exist yet, `up` creates it from the lists you pass, and prints a note saying so.
+
+A sandbox joins a group only when it's created. An existing sandbox can't be moved into a group. To change its group, destroy it and create it again.
+
+### Change the lists
+
+```bash
+sandbox group team domain new-domains.txt   # replaces the domain list for every member
+sandbox group team ip new-ips.txt           # replaces the address list for every member
+```
+
+The change applies at once. The proxy reads its lists again when they change, so members aren't interrupted.
+
+### Work with the whole group
+
+```bash
+sandbox group team status     # network, hub, proxy, lists and members
+sandbox group team verify     # the group's checks, then every running member
+sandbox group team down       # stops every member, the proxy and the firewall rules
+sandbox group team start      # starts them again
+sandbox group list            # every group on this Mac, with its member count
+sandbox group team list       # the members of one group, with their state and address
+```
+
+`verify` tests each running member from inside its own container. A stopped member is skipped with a note, and it isn't tested.
+
+### Work with one member
+
+Members can still be stopped and started on their own:
+
+```bash
+sandbox down app1       # stops only app1's container; the group keeps running for the others
+sandbox start app1      # starts it again, and records its new address with the group
+sandbox verify app1     # checks app1 against the group's lists, firewall and proxy
+```
+
+Stopping one member doesn't touch the group's proxy or firewall.
+
+### Remove members and groups
+
+```bash
+sandbox destroy app1                # removes the member and its entry in the group
+sandbox group delete team           # only when the group has no members
+```
+
+`group delete` removes the group's network, firewall rules and proxy, and archives its settings and logs in the project's `.sandbox/archive/`.
+
+### What each member keeps
+
+Each member's browser data (`browser/`) and captured sessions (`sessions/`) stay in its own folder. Its requests appear in the group's proxy log with the member's name, and its headers and cookies go to its own `sessions/sessions.json`.
 
 ## Input files
 
@@ -322,6 +410,8 @@ api.example.com
 8. In network and both modes, starts the network log.
 9. Prints the mode note and any warnings.
 
+A member of a group skips steps 3 and 5 to 8. Its group does them, and the member is added to the group's member list.
+
 If any step fails, the rollback stops the proxy and the network log, flushes the pf rules, removes the container and network, and moves the sandbox's folder to the project's `.sandbox/failed/` (or keeps the lists, if they came from a clone).
 
 
@@ -340,7 +430,7 @@ sandbox upstream <name> none
 - `status` shows the upstream and whether a CA is trusted. `up` and `upstream` also print the upstream when it's set.
 - Upstream settings are committed with the project.
 
-**Headers and cookies** are recorded per domain in sessions/sessions.json. This happens for every allowed request, with no flag needed. The folder is mounted read-only in the sandbox at /root/sessions. The file holds credentials in plain text, so keep it out of git.
+**Headers and cookies** are recorded per domain in sessions/sessions.json. This happens for every allowed request, with no flag needed. A group member's are recorded in its own `sessions/` folder. The folder is mounted read-only in the sandbox at /root/sessions. The file holds credentials in plain text, so keep it out of git.
 
 **Browser folder and interface**
 
@@ -351,7 +441,7 @@ sandbox upstream <name> none
 
 | Control | How |
 |---|---|
-| Isolation | Each sandbox is an Apple `container` microVM with its own kernel and network |
+| Isolation | Each sandbox is an Apple `container` microVM with its own kernel and network. Members of a group share a network, as described under Groups |
 | Default deny | pf blocks all traffic from the sandbox, except what its lists allow |
 | Proxy path | Web requests go to mitmproxy, which checks each request against `domains.txt` |
 | Host protection | The sandbox can't reach this Mac's services, including SSH |
@@ -374,6 +464,9 @@ Read these before relying on a sandbox:
 - **Credentials.** Logins and API keys live inside the sandbox. An agent that reads them can send them to any reachable host. Use test accounts, and keep the lists tight.
 - **Port restrictions on the proxy.** The domain list matches hostnames, not ports.
 - **The interface has no password.** While a sandbox runs with `--ui`, any process on your Mac can reach `127.0.0.1:6080`.
+- **Members of a group can reach each other.** They share a network, so one member can connect directly to another member's services. Their firewall rules don't separate them. Put in a group only the sandboxes that should trust each other.
+- **Firewall logs and captures belong to the group.** The firewall log doesn't yet name the member behind each entry. The proxy log does name them, and so do the sessions files.
+- **`sandbox logs` doesn't show a member yet.** For a member's web decisions, look in the group's `access.log` in `.sandbox/groups/<project>-<group>/`, and search for the member's name.
 - **Anything inside an allowed host.** Allowed sites are reachable in full. Scope is still the operator's job.
 
 
@@ -387,6 +480,8 @@ Read these before relying on a sandbox:
 - **`sandbox` says this folder isn't a project:** run `sandbox init` in the project folder first, or `cd` into the project.
 - **A sandbox is stopped:** run `sandbox start <name>` to bring it back with its saved settings.
 - **Stray proxy processes:** `pgrep -fl mitmdump` lists them. `sandbox destroy` stops the proxy for its sandbox.
+- **`group delete` refuses:** the group still has members. The message lists them. Destroy them first.
+- **A member can't reach the web:** check that its address is in the group's member list (`sandbox group <group> list`). A member that was started while the group was stopped needs `sandbox group <group> start`.
 
 ## For developers
 

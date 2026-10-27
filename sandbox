@@ -22,7 +22,7 @@ SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
 DEFAULTS_FILE="$SCRIPT_DIR/defaults.txt"
 
 # Set by resolve_project (project commands) and set_sandbox_names (per sandbox).
-PROJECT_ROOT="" PROJECT_NAME="" SB_BASE=""
+PROJECT_ROOT="" PROJECT_NAME="" SB_BASE="" GROUP_BASE=""
 NAME="" DIR=""
 
 die() { echo "sandbox: $*" >&2; exit 1; }
@@ -55,6 +55,7 @@ resolve_project() {
       PROJECT_ROOT="$d"
       PROJECT_NAME="$(json_field "$d/.sandbox/project.json" name)"
       SB_BASE="$d/.sandbox/sandboxes"
+      GROUP_BASE="$d/.sandbox/groups"
       return 0
     fi
     [[ "$d" == "/" ]] && break
@@ -107,6 +108,15 @@ sandboxes/*/env
 sandboxes/*/browser/
 sandboxes/*/sessions/
 sandboxes/*/mitm/
+groups/*/members.json
+groups/*/state.json
+groups/*/domains.txt
+groups/*/ips.txt
+groups/*/*.log
+groups/*/*.out
+groups/*/*.pid
+groups/*/mitm/
+groups/*/sessions/
 sandboxes/*/*.log
 sandboxes/*/*.out
 sandboxes/*/*.pid
@@ -409,13 +419,25 @@ check_upstream() {
 
 # ---------------------------------------------------------------- proxy and firewall
 
+# A sandbox or a group. Their names can't clash in a project, so the name says which folder holds it.
+unit_base() {
+  if [[ -f "$GROUP_BASE/$1/state.json" ]]; then echo "$GROUP_BASE"; else echo "$SB_BASE"; fi
+}
+
+# The unit that runs a sandbox's proxy: its group for a member, otherwise the sandbox itself.
+proxy_owner_of() {
+  local group
+  group="$(json_field "$1/state.json" group)"
+  echo "${group:-$2}"
+}
+
 # The web proxy is mitmproxy: one process per sandbox, on the sandbox's gateway. The addon
 # (~/.sandbox/bin/sbx_addon.py) enforces the lists and records headers and cookies.
 ROOTS_PEM="$SANDBOX_HOME/roots.pem"
 
 proxy_pids() {
   local pid
-  pid="$(cat "$SB_BASE/$1/proxy.pid" 2>/dev/null || true)"
+  pid="$(cat "$(unit_base "$1")/$1/proxy.pid" 2>/dev/null || true)"
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
   return 0
 }
@@ -432,7 +454,8 @@ proxy_trust_bundle() {
 
 # Starts the proxy for a sandbox, restarting it if it runs. Domain, pin and upstream changes go through here.
 reload_or_start_proxy() {
-  local name="$1" dir="$SB_BASE/$1" gateway trust
+  local name="$1" dir gateway trust
+  dir="$(unit_base "$1")/$name"
   local args=()
   gateway="$(json_field "$dir/state.json" gateway)"
   stop_proxy "$name"
@@ -466,18 +489,19 @@ reload_or_start_proxy() {
 stop_proxy() {
   local pids
   pids="$(proxy_pids "$1")"
-  if [[ -z "$pids" ]]; then rm -f "$SB_BASE/$1/proxy.pid"; return 0; fi
+  if [[ -z "$pids" ]]; then rm -f "$(unit_base "$1")/$1/proxy.pid"; return 0; fi
   kill $pids 2>/dev/null || true
   for _ in 1 2 3 4 5; do
-    if [[ -z "$(proxy_pids "$1")" ]]; then rm -f "$SB_BASE/$1/proxy.pid"; return 0; fi
+    if [[ -z "$(proxy_pids "$1")" ]]; then rm -f "$(unit_base "$1")/$1/proxy.pid"; return 0; fi
     sleep 1
   done
   kill -9 $pids 2>/dev/null || true
-  rm -f "$SB_BASE/$1/proxy.pid"
+  rm -f "$(unit_base "$1")/$1/proxy.pid"
 }
 
 load_pf_anchor() {
-  local name="$1" dir="$SB_BASE/$1"
+  local name="$1" dir
+  dir="$(unit_base "$1")/$name"
   local subnet gateway bridge mode cidr cidrs=()
   subnet="$(json_field "$dir/state.json" subnet)"
   gateway="$(json_field "$dir/state.json" gateway)"
@@ -571,6 +595,12 @@ rollback_up() {
   [[ -n "${UP_WORK:-}" ]] && rm -rf "$UP_WORK"
   [[ $rc -eq 0 ]] && return 0
   echo "sandbox: 'up $UP_NAME' failed (exit $rc); removing what it created" >&2
+  if [[ -n "${UP_GROUP:-}" ]]; then
+    # A member shares its group's network, proxy and firewall, so only its own container goes.
+    container rm -f "$UP_CONTAINER" >/dev/null 2>&1 || true
+    members_update "$UP_GROUP" remove "$UP_NAME" >/dev/null 2>&1 || true
+    return $rc
+  fi
   stop_proxy "$UP_NAME"
   stop_capture "$UP_NAME"
   flush_pf_anchor "$UP_NAME"
@@ -612,18 +642,380 @@ cmd_ui() {
   open "$url" >/dev/null 2>&1 || true
 }
 
+# ---------------------------------------------------------------- groups
+
+# A group is a shared network for sandboxes in one project, with one set of lists, one proxy and one firewall
+# anchor. Members are added with: sandbox up <name> --group <group>. Group names are unique within a project,
+# and a group can't share a name with a sandbox in the same project.
+
+# Members of a group: the sandboxes whose state records this group's full name.
+group_members_of() {
+  local full="$1" dir
+  for dir in "$SB_BASE"/*/; do
+    [[ -f "$dir/state.json" ]] || continue
+    if grep -q "\"group\": \"$full\"" "$dir/state.json"; then basename "$dir"; fi
+  done
+}
+
+# Removes what a failed group create left behind (the hub and the network), then stops.
+group_create_fail() {
+  container rm -f "grp-$NAME" >/dev/null 2>&1 || true
+  container network delete "sbx-$NAME" >/dev/null 2>&1 || true
+  die "$1"
+}
+
+group_create() {
+  local short="${1:-}" domains="" ips_src="" pin_src="" use_defaults=1 gdir network subnet candidate gateway bridge
+  [[ -n "$short" ]] || die "usage: sandbox group create <group> [-d <file>] [-i <file>] [-p <file>] [--no-defaults]"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--domains|-i|--ips|-p|--pinned)
+        [[ $# -ge 2 ]] || die "$1 needs a value"
+        case "$1" in
+          -d|--domains) domains="$2" ;;
+          -i|--ips) ips_src="$2" ;;
+          *) pin_src="$2" ;;
+        esac
+        shift
+        ;;
+      --no-defaults) use_defaults=0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  case "$short" in list|create|delete) die "'$short' is a reserved word. Pick another group name" ;; esac
+  set_sandbox_names "$short"
+  gdir="$GROUP_BASE/$NAME"
+  network="sbx-$NAME"
+  [[ ! -d "$gdir" ]] || die "group '$short' already exists in this project"
+  [[ ! -d "$SB_BASE/$NAME" ]] || die "'$short' is the name of a sandbox in this project. Pick another group name"
+  [[ -z "$domains" || -f "$domains" ]] || die "domain file not found: $domains"
+  [[ -z "$ips_src" || -f "$ips_src" ]] || die "IP file not found: $ips_src"
+  [[ -z "$pin_src" || -f "$pin_src" ]] || die "pinned-host file not found: $pin_src"
+  [[ -f "$BIN_DIR/sbx_addon.py" && -f "$CA_DIR/ca.crt" ]] || die "this Mac isn't set up yet. Run: sudo ./install.sh"
+
+  # Check every list before anything is created. work is global so the EXIT trap can still see it.
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  : > "$work/engagement"
+  [[ -z "$domains" ]] || check_domain_file "$domains" "$work/engagement"
+  : > "$work/ips.txt"
+  [[ -z "$ips_src" ]] || normalize_ips "$ips_src" none "$work/ips.txt"
+  {
+    [[ $use_defaults -eq 1 ]] && grep -vE '^[[:space:]]*(#|$)' "$DEFAULTS_FILE"
+    cat "$work/engagement"
+  } | awk '!seen[$0]++' > "$work/domains.txt"
+  : > "$work/pinned"
+  [[ -z "$pin_src" ]] || check_pinned_file "$pin_src" "$work/domains.txt" "$work/pinned"
+
+  if container network list 2>/dev/null | awk '{print $1}' | grep -qx "$network"; then
+    die "a leftover network named $network exists. Run 'sandbox group delete $short', or reboot if it stays"
+  fi
+  subnet=""
+  while IFS= read -r candidate; do
+    container network create "$network" --subnet "$candidate" >/dev/null 2>&1 || continue
+    if probe_network "$network"; then
+      subnet="$candidate"
+      break
+    fi
+    echo "skipping $candidate: outbound test failed" >&2
+    container network delete "$network" >/dev/null 2>&1 || true
+  done < <(candidate_subnets)
+  [[ -n "$subnet" ]] || die "no address range passed the outbound test; reboot, then try again"
+  # The bridge that carries the gateway exists only while a container is on the network, so the group keeps a
+  # small hub container there. Members join the same network later. The hub is removed with the group.
+  container run -d --name "grp-$NAME" --network "$network" "$SANDBOX_IMAGE" tail -f /dev/null >/dev/null \
+    || group_create_fail "could not start the group's hub container grp-$NAME"
+  gateway="$(container inspect "grp-$NAME" | grep -o '"ipv4Gateway" : "[^"]*"' | head -1 | cut -d'"' -f4)"
+  [[ -n "$gateway" ]] || group_create_fail "could not read the gateway of network $network"
+  bridge="$(find_bridge "$gateway")"
+
+  mkdir -p "$gdir"
+  echo "both" > "$gdir/access-mode"
+  echo "[]" > "$gdir/members.json"
+  echo "$use_defaults" > "$gdir/defaults"
+  cp "$work/engagement" "$gdir/engagement.txt"
+  cp "$work/domains.txt" "$gdir/domains.txt"
+  cp "$work/ips.txt" "$gdir/ips.txt"
+  cp "$work/pinned" "$gdir/pinned.txt"
+  printf '{\n  "name": "%s",\n  "kind": "group",\n  "project": "%s",\n  "network": "%s",\n  "subnet": "%s",\n  "gateway": "%s",\n  "bridge": "%s",\n  "created": "%s"\n}\n' \
+    "$NAME" "$PROJECT_NAME" "$network" "$subnet" "$gateway" "$bridge" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$gdir/state.json"
+
+  load_pf_anchor "$NAME"
+  reload_or_start_proxy "$NAME"
+  echo "group $short created in $PROJECT_NAME: network $network, subnet $subnet"
+  echo "its lists apply to every member. Add a sandbox with: sandbox up <name> --group $short"
+  if [[ ! -s "$gdir/domains.txt" ]]; then echo "note: no domains are listed, so the group's members can't reach any web site yet"; fi
+  return 0
+}
+
+group_list() {
+  local proj pname gdir gname found=0 members
+  printf '%-14s %-16s %-18s %-18s %s\n' PROJECT GROUP SUBNET NETWORK MEMBERS
+  [[ -f "$PROJECTS_FILE" ]] || { echo "no groups yet. Create one with: sandbox group create <group>"; return 0; }
+  while IFS= read -r proj; do
+    [[ -f "$proj/.sandbox/project.json" ]] || continue
+    pname="$(json_field "$proj/.sandbox/project.json" name)"
+    for gdir in "$proj/.sandbox/groups"/*/; do
+      [[ -f "$gdir/state.json" ]] || continue
+      found=1
+      gname="$(basename "$gdir")"
+      gname="${gname#"$pname"-}"
+      SB_BASE="$proj/.sandbox/sandboxes"
+      members="$(group_members_of "$pname-$gname" | wc -l | tr -d ' ')"
+      printf '%-14s %-16s %-18s %-18s %s\n' "$pname" "$gname" "$(json_field "$gdir/state.json" subnet)" \
+        "$(json_field "$gdir/state.json" network)" "$members"
+    done
+  done < "$PROJECTS_FILE"
+  [[ $found -eq 1 ]] || echo "no groups yet. Create one with: sandbox group create <group>"
+  return 0
+}
+
+group_members() {
+  local short="${1:-}" dir member state addr
+  [[ -n "$short" ]] || die "usage: sandbox group <group> list"
+  set_sandbox_names "$short"
+  [[ -f "$GROUP_BASE/$NAME/state.json" ]] || die "no group named '$short' in this project"
+  echo "group $short: network sbx-$NAME, subnet $(json_field "$GROUP_BASE/$NAME/state.json" subnet)"
+  local found=0
+  while IFS= read -r member; do
+    [[ -n "$member" ]] || continue
+    found=1
+    state="$(container list --all 2>/dev/null | awk -v c="sbx-$member" '$1==c{print $5}')"
+    addr="$(container_ip "sbx-$member")"
+    printf '  %-28s %-10s %s\n' "${member#"$PROJECT_NAME"-}" "${state:-missing}" "${addr:-no address}"
+  done < <(group_members_of "$NAME")
+  [[ $found -eq 1 ]] || echo "  no members yet. Add one with: sandbox up <name> --group $short"
+  return 0
+}
+
+group_delete() {
+  local short="${1:-}" members archive
+  [[ -n "$short" ]] || die "usage: sandbox group delete <group>"
+  set_sandbox_names "$short"
+  [[ -f "$GROUP_BASE/$NAME/state.json" ]] || die "no group named '$short' in this project"
+  members="$(group_members_of "$NAME" | sed "s/^$PROJECT_NAME-//" | tr '\n' ' ')"
+  [[ -z "${members// /}" ]] || die "group '$short' still has members: $members. Destroy them first"
+  stop_proxy "$NAME"
+  flush_pf_anchor "$NAME"
+  container rm -f "grp-$NAME" >/dev/null 2>&1 || true
+  container network delete "sbx-$NAME" >/dev/null 2>&1 || echo "note: the network sbx-$NAME could not be removed. Check with: container network list" >&2
+  mkdir -p "$PROJECT_ROOT/.sandbox/archive"
+  archive="$PROJECT_ROOT/.sandbox/archive/group-$NAME-$(date +%Y%m%d-%H%M%S)"
+  mv "$GROUP_BASE/$NAME" "$archive"
+  echo "group $short deleted. Its settings and logs are in $archive"
+  return 0
+}
+
+# The member helpers. A group's proxy accepts only the addresses in its members.json. The proxy reads that file
+# again whenever it changes, so no restart is needed.
+container_ip() {
+  container inspect "$1" 2>/dev/null | grep -o '"ipv4Address" : "[^"]*"' | head -1 | cut -d'"' -f4 | cut -d/ -f1
+}
+
+# Adds (add) or removes (remove) a member in a group's members.json.
+members_update() {
+  local gdir="$GROUP_BASE/$1" action="$2" member="$3" ip="${4:-}"
+  python3 -I - "$gdir/members.json" "$action" "$member" "$ip" "$SB_BASE/$member/sessions" <<'PY'
+import json, os, sys
+path, action, member, ip, sessions = sys.argv[1:6]
+items = json.load(open(path)) if os.path.exists(path) else []
+items = [m for m in items if m["name"] != member]
+if action == "add":
+    items.append({"name": member, "ip": ip, "sessions": sessions})
+with open(path + ".tmp", "w") as f:
+    json.dump(items, f, indent=2)
+    f.write("\n")
+os.replace(path + ".tmp", path)
+PY
+}
+
+# Starts a member: its container, its interface, and its address in the group's members.json. The group's
+# proxy and firewall keep running, so only the member's container is involved.
+member_start() {
+  local group="$2" state ip
+  state="$(container list --all 2>/dev/null | awk -v c="sbx-$NAME" '$1==c{print $5}')"
+  [[ -n "$state" ]] || die "the container for $1 is missing; run 'sandbox destroy $1' and 'sandbox up' again"
+  if [[ "$state" != "running" ]]; then
+    container start "sbx-$NAME" >/dev/null || die "could not start the container sbx-$NAME"
+    if [[ -f "$DIR/ui" ]]; then start_ui "sbx-$NAME"; fi
+  fi
+  ip="$(container_ip "sbx-$NAME")"
+  members_update "$group" add "$NAME" "$ip"
+  echo "sandbox $1 started (group $group, address $ip). Check it with: sandbox verify $1"
+}
+
+# The group commands below act on a group by its name in this project.
+group_need() {
+  set_sandbox_names "$1"
+  [[ -f "$GROUP_BASE/$NAME/state.json" ]] || die "no group named '$1' in this project"
+}
+
+# The members of a group, by short name.
+group_member_shorts() {
+  local m
+  while IFS= read -r m; do
+    [[ -n "$m" ]] && echo "${m#"$PROJECT_NAME"-}"
+  done < <(group_members_of "$NAME")
+  return 0
+}
+
+group_domain() {
+  local short="${1:-}" file="${2:-}" gdir defaults_on
+  [[ -n "$short" && -n "$file" ]] || die "usage: sandbox group <group> domain <domains-file>"
+  group_need "$short"
+  gdir="$GROUP_BASE/$NAME"
+  [[ -f "$file" ]] || die "domain file not found: $file"
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  check_domain_file "$file" "$work/engagement"
+  cp "$work/engagement" "$gdir/engagement.txt"
+  defaults_on="$(cat "$gdir/defaults" 2>/dev/null || echo 1)"
+  {
+    [[ $defaults_on -eq 1 ]] && grep -vE '^[[:space:]]*(#|$)' "$DEFAULTS_FILE"
+    cat "$gdir/engagement.txt"
+  } | awk '!seen[$0]++' > "$gdir/domains.txt"
+  # The proxy reads its lists again when they change. It's started only if it isn't running.
+  [[ -n "$(proxy_pids "$NAME")" ]] || reload_or_start_proxy "$NAME"
+  echo "group $short: $(grep -c . "$gdir/domains.txt" || true) domain(s) loaded for every member"
+  grep -qx all "$gdir/domains.txt" && echo "WARNING: 'all' is set for domains. The proxy allows every hostname for every member."
+  return 0
+}
+
+group_ip() {
+  local short="${1:-}" file="${2:-}" gdir subnet
+  [[ -n "$short" && -n "$file" ]] || die "usage: sandbox group <group> ip <ips-file>"
+  group_need "$short"
+  gdir="$GROUP_BASE/$NAME"
+  [[ -f "$file" ]] || die "IP file not found: $file"
+  subnet="$(json_field "$gdir/state.json" subnet)"
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  normalize_ips "$file" "$subnet" "$work/ips.txt"
+  cp "$file" "$gdir/ips-source.txt"
+  cp "$work/ips.txt" "$gdir/ips.txt"
+  load_pf_anchor "$NAME"
+  echo "group $short: $(grep -c . "$gdir/ips.txt" || true) address block(s) loaded for every member, and the firewall reloaded"
+  grep -qx "0.0.0.0/0" "$gdir/ips.txt" && echo "WARNING: 'all' is set for addresses. Every member can reach every address directly."
+  return 0
+}
+
+group_down() {
+  local short="${1:-}" m n=0
+  [[ -n "$short" ]] || die "usage: sandbox group <group> down"
+  group_need "$short"
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    container stop "sbx-$PROJECT_NAME-$m" >/dev/null 2>&1 || true
+    n=$((n + 1))
+  done < <(group_member_shorts)
+  stop_proxy "$NAME"
+  flush_pf_anchor "$NAME"
+  container stop "grp-$NAME" >/dev/null 2>&1 || true
+  echo "group $short down: $n member(s) stopped, and its proxy and firewall stopped. State kept"
+  return 0
+}
+
+group_start() {
+  local short="${1:-}" gdir state gateway bridge current m ip n=0
+  [[ -n "$short" ]] || die "usage: sandbox group <group> start"
+  group_need "$short"
+  gdir="$GROUP_BASE/$NAME"
+  state="$(container list --all 2>/dev/null | awk -v c="grp-$NAME" '$1==c{print $5}')"
+  [[ -n "$state" ]] || die "the hub container for group $short is missing. Delete the group and create it again"
+  if [[ "$state" != "running" ]]; then
+    container start "grp-$NAME" >/dev/null || die "could not start the hub container grp-$NAME"
+  fi
+  # The bridge can be renamed by macOS after a reboot. The gateway identifies the group, as for sandboxes.
+  gateway="$(json_field "$gdir/state.json" gateway)"
+  bridge="$(json_field "$gdir/state.json" bridge)"
+  current="$(find_bridge "$gateway")"
+  if [[ "$current" != "$bridge" ]]; then
+    sed -i '' "s/\"bridge\": \"$bridge\"/\"bridge\": \"$current\"/" "$gdir/state.json"
+    echo "macOS renamed the group's bridge ($bridge -> $current). Saved the new name."
+  fi
+  load_pf_anchor "$NAME"
+  reload_or_start_proxy "$NAME"
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    if [[ "$(container list --all 2>/dev/null | awk -v c="sbx-$PROJECT_NAME-$m" '$1==c{print $5}')" != "running" ]]; then
+      container start "sbx-$PROJECT_NAME-$m" >/dev/null 2>&1 || { echo "could not start $m" >&2; continue; }
+      if [[ -f "$SB_BASE/$PROJECT_NAME-$m/ui" ]]; then start_ui "sbx-$PROJECT_NAME-$m"; fi
+    fi
+    ip="$(container_ip "sbx-$PROJECT_NAME-$m")"
+    members_update "$NAME" add "$PROJECT_NAME-$m" "$ip"
+    n=$((n + 1))
+  done < <(group_member_shorts)
+  echo "group $short started: $n member(s) started, and its proxy and firewall restored"
+  return 0
+}
+
+group_status() {
+  local short="${1:-}" gdir hub proxy rules m state addr
+  [[ -n "$short" ]] || die "usage: sandbox group <group> status"
+  group_need "$short"
+  gdir="$GROUP_BASE/$NAME"
+  hub="$(container list --all 2>/dev/null | awk -v c="grp-$NAME" '$1==c{print $5}')"
+  proxy="$(proxy_pids "$NAME")"
+  rules="$(pf_show "$NAME" | grep -c . || true)"
+  echo "group:     $short (project $PROJECT_NAME)"
+  echo "network:   sbx-$NAME  subnet $(json_field "$gdir/state.json" subnet)  gateway $(json_field "$gdir/state.json" gateway)"
+  echo "hub:       ${hub:-missing}"
+  if [[ -n "$proxy" ]]; then echo "proxy:     running (pid $proxy)"; else echo "proxy:     stopped"; fi
+  echo "domains:   $(grep -cvE '^(#|$)' "$gdir/domains.txt" || true) allowed"
+  echo "addresses: $(grep -c . "$gdir/ips.txt" || true) block(s) in ips.txt"
+  echo "pf rules:  $rules loaded"
+  echo "members:"
+  if [[ -z "$(group_member_shorts)" ]]; then
+    echo "  none yet"
+  fi
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    state="$(container list --all 2>/dev/null | awk -v c="sbx-$PROJECT_NAME-$m" '$1==c{print $5}')"
+    addr="$(container_ip "sbx-$PROJECT_NAME-$m")"
+    printf '  %-28s %-10s %s\n' "$m" "${state:-missing}" "${addr:-no address}"
+  done < <(group_member_shorts)
+  return 0
+}
+
+group_verify() {
+  local short="${1:-}" m state rc=0 hub proxy
+  [[ -n "$short" ]] || die "usage: sandbox group <group> verify"
+  group_need "$short"
+  hub="$(container list --all 2>/dev/null | awk -v c="grp-$NAME" '$1==c{print $5}')"
+  proxy="$(proxy_pids "$NAME")"
+  echo "group $short:"
+  [[ "$hub" == "running" ]] && echo "PASS  the group's hub container is running" || { echo "FAIL  the group's hub container is not running"; rc=1; }
+  [[ -n "$proxy" ]] && echo "PASS  the group's proxy is running" || { echo "FAIL  the group's proxy is not running"; rc=1; }
+  [[ -n "$(pf_show "$NAME")" ]] && echo "PASS  the group's firewall rules are loaded" || { echo "FAIL  the group's firewall rules are not loaded"; rc=1; }
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    state="$(container list --all 2>/dev/null | awk -v c="sbx-$PROJECT_NAME-$m" '$1==c{print $5}')"
+    echo
+    if [[ "$state" != "running" ]]; then
+      echo "SKIP  member $m is ${state:-missing}; it wasn't tested"
+      continue
+    fi
+    echo "member $m:"
+    cmd_verify "$m" || rc=1
+  done < <(group_member_shorts)
+  return $rc
+}
+
 cmd_up() {
   local short="${1:-}"
   shift || true
   [[ -n "$short" ]] || die "usage: sandbox up <name> [-m web|network|both] [-d <domains-file>] [-i <ips-file>] [-p <pinned-file>] [--upstream <host:port> [--upstream-ca <pem>]] [--no-defaults]"
   set_sandbox_names "$short"
   local name="$NAME" dir="$DIR"
+  [[ ! -d "$GROUP_BASE/$name" ]] || die "'$short' is the name of a group in this project. Pick another sandbox name"
 
   local mode="" mode_given=0 domains="" ips_src="" pin_src="" up_spec="" up_ca="" use_defaults=1 defaults_given=0
-  local env_args=() env_file_src="" ui=0
+  local env_args=() env_file_src="" ui=0 group_name=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -m|--mode|-d|--domains|-i|--ips|-p|--pinned|--upstream|--upstream-ca|-e|--env|--env-file)
+      -m|--mode|-d|--domains|-i|--ips|-p|--pinned|--upstream|--upstream-ca|-e|--env|--env-file|--group)
         [[ $# -ge 2 ]] || die "$1 needs a value"
         case "$1" in
           -m|--mode) mode="$2"; mode_given=1 ;;
@@ -631,6 +1023,7 @@ cmd_up() {
           -p|--pinned) pin_src="$2" ;;
           --upstream) up_spec="$2" ;;
           --upstream-ca) up_ca="$2" ;;
+          --group) group_name="$2" ;;
           -e|--env) env_args+=("$2") ;;
           --env-file) env_file_src="$2" ;;
           *) ips_src="$2" ;;
@@ -644,6 +1037,29 @@ cmd_up() {
     shift
   done
 
+  # A member takes the group's network and lists. Its own settings aren't allowed here.
+  local group_full=""
+  if [[ -n "$group_name" ]]; then
+    [[ "$group_name" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || die "group name '$group_name' must be lowercase letters, digits and hyphens"
+    group_full="$PROJECT_NAME-$group_name"
+    if [[ ! -f "$GROUP_BASE/$group_full/state.json" ]]; then
+      # The group doesn't exist yet: create it from the lists given here, and say so.
+      [[ -z "$up_spec$up_ca" ]] || die "upstream settings belong to the group, not to a sandbox joining it. Create the group with: sandbox group create $group_name --help"
+      echo "note: group '$group_name' did not exist in this project, so it was created now with the lists given to up"
+      local gargs=()
+      [[ -z "$domains" ]] || gargs+=(-d "$domains")
+      [[ -z "$ips_src" ]] || gargs+=(-i "$ips_src")
+      [[ -z "$pin_src" ]] || gargs+=(-p "$pin_src")
+      (( defaults_given == 0 )) && gargs+=(--no-defaults)
+      ( group_create "$group_name" ${gargs[@]+"${gargs[@]}"} ) || die "could not create group '$group_name'"
+    else
+      [[ -z "$domains$ips_src$pin_src$up_spec$up_ca" ]] || die "members use their group's lists and upstream. Change the lists with: sandbox group $group_name domain|ip <file>"
+      (( defaults_given == 0 )) || die "--no-defaults belongs to the group (sandbox group create), not to its members"
+    fi
+    if (( mode_given )) && [[ "$mode" != "both" ]]; then die "group members use mode both"; fi
+    mode="both"
+    mode_given=1
+  fi
   [[ ! -f "$dir/state.json" ]] || die "sandbox '$short' is already running. Use 'sandbox down $short' and 'sandbox destroy $short' first"
 
   local existed=0
@@ -710,26 +1126,32 @@ cmd_up() {
     [[ "$env_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "environment entry must be NAME=VALUE (got a line with no name or '=')"
   done < "$work/env"
 
-  UP_NAME="$name" UP_DIR="$dir" UP_CONTAINER="sbx-$name" UP_NETWORK="sbx-$name" UP_WORK="$work" UP_EXISTED="$existed"
+  UP_NAME="$name" UP_DIR="$dir" UP_CONTAINER="sbx-$name" UP_NETWORK="sbx-$name" UP_WORK="$work" UP_EXISTED="$existed" UP_GROUP="$group_full"
   trap rollback_up EXIT
 
   local subnet="" candidate network="sbx-$name" container="sbx-$name"
-  if container network list 2>/dev/null | awk '{print $1}' | grep -qx "$network"; then
+  if [[ -n "$group_full" ]]; then
+    network="sbx-$group_full"
+    subnet="$(json_field "$GROUP_BASE/$group_full/state.json" subnet)"
+  fi
+  if [[ -z "$group_full" ]] && container network list 2>/dev/null | awk '{print $1}' | grep -qx "$network"; then
     die "a leftover network named $network exists. Run 'sandbox destroy $short'. If it stays, the container service holds a stale record: reboot your Mac, then retry"
   fi
   if container list --all 2>/dev/null | awk '{print $1}' | grep -qx "$container"; then
     die "a leftover container named $container exists; run 'sandbox destroy $short' or remove it, then retry"
   fi
-  while IFS= read -r candidate; do
-    container network create "$network" --subnet "$candidate" >/dev/null 2>&1 || continue
-    if probe_network "$network"; then
-      subnet="$candidate"
-      break
-    fi
-    echo "skipping $candidate: outbound test failed" >&2
-    container network delete "$network" >/dev/null 2>&1 || true
-  done < <(candidate_subnets)
-  [[ -n "$subnet" ]] || die "no address range passed the outbound test; reboot, then run 'sandbox up' again"
+  if [[ -z "$group_full" ]]; then
+    while IFS= read -r candidate; do
+      container network create "$network" --subnet "$candidate" >/dev/null 2>&1 || continue
+      if probe_network "$network"; then
+        subnet="$candidate"
+        break
+      fi
+      echo "skipping $candidate: outbound test failed" >&2
+      container network delete "$network" >/dev/null 2>&1 || true
+    done < <(candidate_subnets)
+    [[ -n "$subnet" ]] || die "no address range passed the outbound test; reboot, then run 'sandbox up' again"
+  fi
   # Proxy defaults for web modes, then the operator's variables. For a repeated name, the last entry wins.
   local gateway_ip="${subnet%.0/24}.1" run_env=() kv
   local envfile="$work/run-env"
@@ -766,7 +1188,7 @@ cmd_up() {
   chmod 600 "$dir/env"
   if (( ui )); then echo 1 > "$dir/ui"; else rm -f "$dir/ui"; fi
 
-  if [[ "$mode" != "network" ]]; then
+  if [[ -z "$group_full" && "$mode" != "network" ]]; then
     cp "$work/engagement" "$dir/engagement.txt"
     echo "$use_defaults" > "$dir/defaults"
     {
@@ -779,7 +1201,7 @@ cmd_up() {
     elif [[ -z "$up_ca" ]]; then rm -f "$dir/upstream-ca.pem"
     fi
   fi
-  if [[ "$mode" != "web" ]]; then
+  if [[ -z "$group_full" && "$mode" != "web" ]]; then
     if [[ -n "$ips_src" && "$ips_src" != "$dir/ips-source.txt" ]]; then
       cp "$ips_src" "$dir/ips-source.txt"
     elif [[ -z "$ips_src" ]]; then
@@ -790,13 +1212,17 @@ cmd_up() {
 
   printf '{\n  "name": "%s",\n  "sandbox": "%s",\n  "project": "%s",\n  "network": "%s",\n  "subnet": "%s",\n  "container": "%s",\n  "gateway": "%s",\n  "bridge": "%s",\n  "created": "%s"\n}\n' \
     "$name" "$short" "$PROJECT_NAME" "$network" "$subnet" "$container" "$gateway" "$bridge" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$dir/state.json"
-
-  if [[ "$mode" != "network" ]]; then
-    reload_or_start_proxy "$name"
-  fi
-  load_pf_anchor "$name"
-  if [[ "$mode" != "web" ]]; then
-    start_capture "$name"
+  if [[ -n "$group_full" ]]; then
+    sed -i '' "s/^  \"name\": \"$name\",\$/  \"name\": \"$name\",\n  \"group\": \"$group_full\",/" "$dir/state.json"
+    members_update "$group_full" add "$name" "$(container_ip "$container")"
+  else
+    if [[ "$mode" != "network" ]]; then
+      reload_or_start_proxy "$name"
+    fi
+    load_pf_anchor "$name"
+    if [[ "$mode" != "web" ]]; then
+      start_capture "$name"
+    fi
   fi
 
   echo
@@ -816,7 +1242,9 @@ cmd_up() {
       echo "          Web ports on those addresses are open to direct traffic too, so list only addresses you own or trust."
       ;;
   esac
-  if [[ "$mode" != "network" ]]; then
+  if [[ -n "$group_full" ]]; then
+    echo "joined group $group_name: its proxy on $gateway:$PROXY_PORT checks this sandbox's requests. Lists and upstream come from the group"
+  elif [[ "$mode" != "network" ]]; then
     echo "proxy on $gateway:$PROXY_PORT"
     [[ -s "$dir/engagement.txt" ]] || echo "note: no domains were given, so no web traffic is allowed. Load some with: sandbox domain $short <file>"
     grep -qx all "$dir/domains.txt" && echo "WARNING: 'all' is set for domains. The proxy allows every hostname."
@@ -829,7 +1257,7 @@ cmd_up() {
       upstream_warning "$(cat "$dir/upstream")"
     fi
   fi
-  if [[ "$mode" != "web" ]]; then
+  if [[ "$mode" != "web" && -z "$group_full" ]]; then
     [[ -s "$dir/ips.txt" ]] || echo "note: no addresses were given, so no raw traffic is allowed. Load some with: sandbox ip $short <file>"
     grep -qx "0.0.0.0/0" "$dir/ips.txt" && echo "$(ip_all_warning "$dir")"
   fi
@@ -838,6 +1266,10 @@ cmd_up() {
 
 cmd_start() {
   require_sandbox "${1:-}"
+  if [[ -n "$(json_field "$DIR/state.json" group)" ]]; then
+    member_start "${1}" "$(json_field "$DIR/state.json" group)"
+    return 0
+  fi
   local dir="$DIR" name="$NAME" mode gateway bridge state
   mode="$(cat "$dir/access-mode")"
   gateway="$(json_field "$dir/state.json" gateway)"
@@ -972,7 +1404,7 @@ cmd_status() {
   require_sandbox "${1:-}"
   local dir="$DIR" name="$NAME" state proxy rules
   state="$(container list --all 2>/dev/null | awk -v c="sbx-$name" '$1==c{print $5}')"
-  proxy="$(proxy_pids "$name")"
+  proxy="$(proxy_pids "$(proxy_owner_of "$dir" "$name")")"
   rules="$(pf_show "$name" | grep -c . || true)"
   echo "sandbox:   ${1} (project $PROJECT_NAME)"
   echo "mode:      $(cat "$dir/access-mode")"
@@ -1026,6 +1458,13 @@ cmd_verify() {
   local dir="$DIR" name="$NAME" mode gateway container="sbx-$NAME" failures=0
   mode="$(cat "$dir/access-mode")"
   gateway="$(json_field "$dir/state.json" gateway)"
+  # A member is checked against its group's lists, firewall and proxy.
+  local owner="$name" ldir="$dir" group_of
+  group_of="$(json_field "$dir/state.json" group)"
+  if [[ -n "$group_of" ]]; then
+    owner="$group_of"
+    ldir="$GROUP_BASE/$group_of"
+  fi
 
   check() {
     local label="$1" ok="$2"
@@ -1042,7 +1481,7 @@ cmd_verify() {
   code="$(container exec "$container" sh -c "timeout 10 node -e \"const {Resolver}=require('dns');const r=new Resolver({timeout:3000,tries:1});r.setServers(['8.8.8.8']);r.resolve4('example.com',e=>console.log(e?'no-answer':'answered'))\" 2>/dev/null || echo no-answer" 2>/dev/null || true)"
   check "DNS over UDP is blocked (8.8.8.8)" "$([[ "$code" == *no-answer* ]] && echo yes || echo no)"
   # TCP 53 is closed by the same policy, except when ips.txt allows every address.
-  if grep -qx "0.0.0.0/0" "$dir/ips.txt" 2>/dev/null; then
+  if grep -qx "0.0.0.0/0" "$ldir/ips.txt" 2>/dev/null; then
     echo "SKIP  DNS over TCP is blocked (ips.txt allows every address)"
   else
     code="$(container exec "$container" sh -c 'nc -z -w 3 8.8.8.8 53 && echo open || echo closed' 2>/dev/null || true)"
@@ -1053,21 +1492,21 @@ cmd_verify() {
   check "host SSH is unreachable from the sandbox" "$([[ "$code" == *closed* ]] && echo yes || echo no)"
 
   code="$(container exec "$container" sh -c 'nc -z -w 5 192.0.2.1 443 && echo open || echo closed' 2>/dev/null || true)"
-  if [[ -f "$dir/ips.txt" ]] && grep -qx "0.0.0.0/0" "$dir/ips.txt"; then
+  if [[ -f "$ldir/ips.txt" ]] && grep -qx "0.0.0.0/0" "$ldir/ips.txt"; then
     echo "SKIP  an address outside the policy is blocked (ips.txt allows every address)"
   else
     check "an address outside the sandbox policy is blocked" "$([[ "$code" == *closed* ]] && echo yes || echo no)"
   fi
 
   local rules
-  rules="$(pf_show "$name")"
+  rules="$(pf_show "$owner")"
   check "pf default-deny rule is loaded" "$([[ "$rules" == *"block drop"* ]] && echo yes || echo no)"
 
   if [[ "$mode" != "network" ]]; then
     local allowed_host
     # Prefer a plain host. A .suffix entry only covers subdomains, so test a www. name under it.
-    allowed_host="$(grep -vE '^(#|$|all$|\.)' "$dir/domains.txt" 2>/dev/null | head -1)"
-    [[ -n "$allowed_host" ]] || allowed_host="$(grep -E '^\.' "$dir/domains.txt" 2>/dev/null | head -1 | sed 's/^\./www./')"
+    allowed_host="$(grep -vE '^(#|$|all$|\.)' "$ldir/domains.txt" 2>/dev/null | head -1)"
+    [[ -n "$allowed_host" ]] || allowed_host="$(grep -E '^\.' "$ldir/domains.txt" 2>/dev/null | head -1 | sed 's/^\./www./')"
     if [[ -n "$allowed_host" ]]; then
       # A failed request (curl exit != 0, e.g. a dead upstream) counts as not allowed.
       code="$(container exec "$container" sh -c "h=\$(curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT https://$allowed_host/) || { echo curl-failed; exit 0; }; printf '%s\n' \"\$h\" | grep -i '^x-squid-error' || echo allowed" 2>/dev/null || true)"
@@ -1080,7 +1519,7 @@ cmd_verify() {
     fi
 
     # With 'all' in the domain list, every host is allowed, so there's no unlisted host to test.
-    if grep -qx all "$dir/domains.txt" 2>/dev/null; then
+    if grep -qx all "$ldir/domains.txt" 2>/dev/null; then
       echo "SKIP  proxy refuses a host not in the list (domains.txt allows every host)"
     else
       code="$(container exec "$container" sh -c "curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT https://example.org/ | grep -i '^x-squid-error' || echo allowed" 2>/dev/null || true)"
@@ -1088,7 +1527,7 @@ cmd_verify() {
     fi
     # The SNI is the first listed host and the Host header is a second listed host. The proxy must refuse it.
     local second_host
-    second_host="$(grep -vE '^(#|$|all$|\.)' "$dir/domains.txt" 2>/dev/null | grep -vx "$allowed_host" | head -1)"
+    second_host="$(grep -vE '^(#|$|all$|\.)' "$ldir/domains.txt" 2>/dev/null | grep -vx "$allowed_host" | head -1)"
     if [[ -n "$allowed_host" && -n "$second_host" ]]; then
       code="$(container exec "$container" sh -c "curl -sD - -o /dev/null -m 15 -x http://$gateway:$PROXY_PORT -H 'Host: $second_host' https://$allowed_host/ | grep -i '^x-squid-error' || echo not-refused" 2>/dev/null || true)"
       check "SNI and Host must match (SNI $allowed_host, Host $second_host)" "$([[ "$(printf '%s' "$code" | tr 'A-Z' 'a-z')" == *x-squid-error* ]] && echo yes || echo no)"
@@ -1096,10 +1535,12 @@ cmd_verify() {
       echo "SKIP  SNI and Host must match (needs two listed hosts)"
     fi
 
-    check "proxy is running" "$([[ -n "$(proxy_pids "$name")" ]] && echo yes || echo no)"
+    check "proxy is running" "$([[ -n "$(proxy_pids "$owner")" ]] && echo yes || echo no)"
   fi
 
-  if [[ "$mode" != "web" ]]; then
+  if [[ "$mode" != "web" && -n "$group_of" ]]; then
+    echo "SKIP  network log is recorded for the group, not for each member (not built yet)"
+  elif [[ "$mode" != "web" ]]; then
     local cap_pid
     cap_pid="$(cat "$dir/capture.pid" 2>/dev/null || true)"
     check "network log is recording" "$([[ -n "$cap_pid" ]] && ps -p "$cap_pid" >/dev/null 2>&1 && echo yes || echo no)"
@@ -1116,6 +1557,12 @@ cmd_verify() {
 
 cmd_down() {
   require_sandbox "${1:-}"
+  if [[ -n "$(json_field "$DIR/state.json" group)" ]]; then
+    # A member: only its container stops. The group's proxy and firewall stay up for the other members.
+    container stop "sbx-$NAME" >/dev/null 2>&1 || true
+    echo "sandbox ${1} stopped (state kept). Its group keeps running for the other members"
+    return 0
+  fi
   stop_proxy "$NAME"
   stop_capture "$NAME"
   flush_pf_anchor "$NAME"
@@ -1128,6 +1575,9 @@ cmd_destroy() {
   require_sandbox "${1:-}"
   local dir="$DIR" name="$NAME" archive leftovers=()
   cmd_down "$1" >/dev/null
+  if [[ -n "$(json_field "$dir/state.json" group)" ]]; then
+    members_update "$(json_field "$dir/state.json" group)" remove "$name" >/dev/null 2>&1 || true
+  fi
   container rm -f "sbx-$name" >/dev/null 2>&1 || true
   container network delete "sbx-$name" >/dev/null 2>&1 || true
 
@@ -1162,6 +1612,7 @@ cmd_list() {
     [[ -f "$proj/.sandbox/project.json" ]] || continue
     pname="$(json_field "$proj/.sandbox/project.json" name)"
     SB_BASE="$proj/.sandbox/sandboxes"
+    GROUP_BASE="$proj/.sandbox/groups"
     for dir in "$SB_BASE"/*/; do
       [[ -f "$dir/state.json" ]] || continue
       found=1
@@ -1171,7 +1622,7 @@ cmd_list() {
       state="$(awk -v c="sbx-$name" '$1==c{print $2}' <<<"$containers")"
       if [[ "$mode" == "network" ]]; then
         proxy="n/a"
-      elif [[ -n "$(proxy_pids "$name")" ]]; then
+      elif [[ -n "$(proxy_pids "$(proxy_owner_of "$dir" "$name")")" ]]; then
         proxy="running"
       else
         proxy="stopped"
@@ -1225,6 +1676,11 @@ Inside a project (the project is found from the current folder):
   verify <name>                               run the containment checks (PASS/FAIL)
   shell <name>                                open a shell inside the sandbox
   ui <name>                                   open the sandbox interface in a browser (needs up --ui)
+  group create <group> [-d <file>] [-i <file>] [-p <file>] [--no-defaults]
+                                              create a shared network, proxy and lists for sandboxes in this project
+  group list                                  list every group on this Mac, with its members
+  group <group> list                          list the members of a group
+  group delete <group>                        delete a group with no members (archives its settings and logs)
   pin <name> <file>|none                      hosts that pass through without decryption (web and both)
   upstream <name> <host:port>|none [<ca.pem>] send web through another proxy, such as Burp (web and both)
   logs <name> [-f]                            web decisions (proxy) and network decisions (pf)
@@ -1264,6 +1720,27 @@ case "${1:-}" in
   up) ensure_container_service; resolve_project; shift; cmd_up "$@" ;;
   domain) ensure_container_service; resolve_project; cmd_domain "${2:-}" "${3:-}" ;;
   ip) ensure_container_service; resolve_project; cmd_ip "${2:-}" "${3:-}" ;;
+  group)
+    ensure_container_service
+    case "${2:-}" in
+      list)
+        if [[ -n "${3:-}" ]]; then resolve_project; group_members "$3"; else group_list; fi ;;
+      create) resolve_project; group_create "${3:-}" "${@:4}" ;;
+      delete) resolve_project; group_delete "${3:-}" ;;
+      "") usage >&2; exit 2 ;;
+      *)
+        resolve_project
+        case "${3:-}" in
+          list) group_members "$2" ;;
+          domain) group_domain "$2" "${4:-}" ;;
+          ip) group_ip "$2" "${4:-}" ;;
+          down) group_down "$2" ;;
+          start) group_start "$2" ;;
+          status) group_status "$2" ;;
+          verify) group_verify "$2" ;;
+          *) usage >&2; exit 2 ;;
+        esac ;;
+    esac ;;
   pin) ensure_container_service; resolve_project; cmd_pin "${2:-}" "${3:-}" ;;
   upstream) ensure_container_service; resolve_project; cmd_upstream "${2:-}" "${3:-}" "${4:-}" ;;
   verify) ensure_container_service; resolve_project; cmd_verify "${2:-}" ;;
