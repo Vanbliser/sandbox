@@ -193,7 +193,7 @@ build_image() {
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm nmap netcat-openbsd libnss3-tools xvfb x11vnc novnc websockify \
+ && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm nmap netcat-openbsd libnss3-tools xvfb x11vnc novnc websockify bash-completion less vim nano procps \
  && rm -rf /var/lib/apt/lists/*
 # Playwright 1.59.1 is the version numasec pins. It and its Chromium are staged on the Mac (stage_playwright),
 # so the build doesn't depend on the npm registry.
@@ -1645,7 +1645,7 @@ cmd_shell() {
   state="$(container list --all 2>/dev/null | awk -v c="$container" '$1==c{print $5}')"
   [[ -n "$state" ]] || die "the container for $1 is missing; run 'sandbox destroy $1' and 'sandbox up' again"
   [[ "$state" == "running" ]] || die "$1 is $state; its container is stopped. Start it with: sandbox start $1"
-  container exec -it "$container" sh
+  container exec -it -e "TERM=${TERM:-xterm-256color}" "$container" bash -l
 }
 
 usage() {
