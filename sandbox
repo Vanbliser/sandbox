@@ -76,7 +76,7 @@ set_sandbox_names() {
 
 require_sandbox() {
   set_sandbox_names "${1:-}"
-  [[ -f "$DIR/state.json" ]] || die "no running sandbox named '$1' in this project"
+  [[ -f "$DIR/state.json" ]] || die "no sandbox named '$1' in project '$PROJECT_NAME' ($PROJECT_ROOT)"
 }
 
 cmd_init() {
