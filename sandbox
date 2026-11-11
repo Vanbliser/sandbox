@@ -193,7 +193,7 @@ build_image() {
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm nmap netcat-openbsd libnss3-tools xvfb x11vnc novnc websockify bash-completion less vim nano procps \
+ && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm nmap netcat-openbsd libnss3-tools xvfb x11vnc novnc websockify openbox tint2 xterm bash-completion less vim nano procps \
  && rm -rf /var/lib/apt/lists/*
 # Playwright 1.59.1 is the version numasec pins. It and its Chromium are staged on the Mac (stage_playwright),
 # so the build doesn't depend on the npm registry.
@@ -202,6 +202,16 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw/ms-playwright
 RUN npm install -g /opt/pw/playwright-core-1.59.1.tgz \
  && node /opt/pw/package/cli.js install-deps chromium \
  && rm -rf /var/lib/apt/lists/*
+RUN printf '%s\n' '#!/bin/sh' \
+ 'chrome=$(ls -d /opt/pw/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | head -1)' \
+ '[ -n "$chrome" ] || { echo "sandbox-browser: no browser installed" >&2; exit 1; }' \
+ 'exec "$chrome" --no-sandbox --disable-dev-shm-usage --no-first-run --user-data-dir=/root/browser ${HTTP_PROXY:+--proxy-server=$HTTP_PROXY} "$@"' \
+    > /usr/local/bin/sandbox-browser && chmod +x /usr/local/bin/sandbox-browser \
+ && mkdir -p /root/.config/openbox \
+ && printf '%s\n' '<openbox_menu>' '<menu id="root-menu" label="Sandbox">' \
+    '<item label="Terminal"><action name="Execute"><execute>xterm</execute></action></item>' \
+    '<item label="Browser"><action name="Execute"><execute>/usr/local/bin/sandbox-browser</execute></action></item>' \
+    '</menu>' '</openbox_menu>' > /root/.config/openbox/menu.xml
 COPY trusted-roots/ /usr/local/share/ca-certificates/
 RUN update-ca-certificates
 # Chromium on Linux reads its own NSS database, not the system bundle. Import the same roots so the browser trusts them.
@@ -629,7 +639,8 @@ rollback_up() {
 UI_PORT="${UI_PORT:-6080}"
 start_ui() {
   # The VNC server listens on the container's loopback only. websockify serves noVNC on UI_PORT and bridges it.
-  container exec -d "$1" sh -c 'Xvfb :99 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 & sleep 1; x11vnc -display :99 -forever -shared -nopw -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 & websockify --web /usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1' \
+  # The browser goes through the sandbox proxy, from the HTTP_PROXY the container was started with.
+  container exec -d "$1" sh -c 'Xvfb :99 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 & sleep 1; DISPLAY=:99 openbox >/tmp/openbox.log 2>&1 & DISPLAY=:99 tint2 >/tmp/tint2.log 2>&1 & DISPLAY=:99 xterm -geometry 100x30+20+20 >/tmp/xterm.log 2>&1 & DISPLAY=:99 /usr/local/bin/sandbox-browser about:blank >/tmp/chromium.log 2>&1 & x11vnc -display :99 -forever -shared -nopw -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 & websockify --web /usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1' \
     || die "could not start the sandbox interface in $1"
 }
 
@@ -638,7 +649,7 @@ cmd_ui() {
   local dir="$DIR" url="http://127.0.0.1:$UI_PORT/vnc.html?autoconnect=true&resize=scale"
   [[ -f "$dir/ui" ]] || die "sandbox '$1' was started without the interface. Run: sandbox destroy $1, then: sandbox up $1 --ui"
   echo "sandbox interface: $url"
-  echo "(no password, open only while this Mac is trusted. Browser is the first pane.)"
+  echo "(no password, open only while this Mac is trusted. The sandbox's browser opens on the desktop, through the sandbox proxy.)"
   open "$url" >/dev/null 2>&1 || true
 }
 
