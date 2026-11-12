@@ -88,14 +88,14 @@ If the helper is out of date, `up` and `start` fail, or the firewall rules don't
 |---|---|
 | `sandbox setup` | Once per Mac: create the CA and build the image. The installer runs it for you |
 | `sandbox init` | In a folder: make it a sandbox project |
-| `sandbox up <name> [-m web\|network\|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port>] [--upstream-ca <pem\|der>] [--group <group>] [--ui] [--no-defaults] [-e NAME=VALUE \| --env-file <file>]` | Create a sandbox. Mode defaults to `both`. Missing lists are created empty. With `--group`, it joins that group instead of getting its own network. If the group doesn't exist, it's created from the lists given here, with a note |
+| `sandbox up <name> [-m web\|network\|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port>] [--upstream-ca <pem\|der>] [--group <group>] [--ui] [--publish <port>[:<cport>]] [--no-defaults] [-e NAME=VALUE \| --env-file <file>]` | Create a sandbox. Mode defaults to `both`. Missing lists are created empty. With `--group`, it joins that group instead of getting its own network. If the group doesn't exist, it's created from the lists given here, with a note |
 | `sandbox domain <name> <file>` | Replace the domain list and reload the proxy (web and both) |
 | `sandbox ip <name> <file>` | Replace the IP list and reload the firewall (network and both) |
 | `sandbox pin <name> <file>\|none` | Replace the pinned list on a running sandbox and reloads the proxy. `none` clears the list. |
 | `sandbox status <name>` | Show mode, container, proxy and rules |
 | `sandbox verify <name>` | Run the containment checks, PASS or FAIL for each |
 | `sandbox shell <name>` | Open a shell inside the sandbox |
-| `sandbox ui <name>` | Open the sandbox interface in a browser (needs `up --ui`) |
+| `sandbox ui <name>` | Open the sandbox GUI interface in a browser at `http://127.0.0.1:6080/vnc.html` (needs `up --ui`) |
 | `sandbox logs <name> [-f]` | Web decisions (proxy) and network decisions (pf), or follow them live. It shows only what the sandbox sent or tried to send |
 | `sandbox down <name>` | Stop the container, proxy and rules. Keeps the state. For a group member, stops only its container |
 | `sandbox upstream <name> [<host:port> <ca_file> \| none]` | Sends web traffic through an upstream proxy, such as Burp. The CA file may be PEM or DER. `none` removes it |
@@ -414,6 +414,44 @@ A member of a group skips steps 3 and 5 to 8. Its group does them, and the membe
 
 If any step fails, the rollback stops the proxy and the network log, flushes the pf rules, removes the container and network, and moves the sandbox's folder to the project's `.sandbox/failed/` (or keeps the lists, if they came from a clone).
 
+
+## The sandbox interface (--ui)
+
+`--ui` gives a sandbox a desktop you can see and use from your Mac's browser. Use it when you need to work in the sandbox by hand: log in to a site, click through an app, or use a browser that runs inside the sandbox.
+
+```bash
+sandbox up app1 --ui
+sandbox ui app1          # opens http://127.0.0.1:6080/vnc.html
+```
+
+What you get:
+
+- A Linux desktop with the openbox window manager.
+- A taskbar at the bottom. Minimized windows appear there; click one to restore it.
+- A terminal and a Chromium browser, both started with the desktop. The right-click menu opens more of each.
+- The browser goes through the sandbox's proxy, so its traffic is filtered and recorded like everything else in the sandbox. Its profile is `/root/browser/desktop`, a subfolder of the shared `browser/` folder. Logins and cookies made here aren't shared with the other tools.
+
+To reach a web service running inside the sandbox, start it there and open `http://localhost:<port>` in the sandbox's browser. `localhost` inside the sandbox is the sandbox's own loopback, not your Mac's.
+
+- The page is served on 127.0.0.1 with no password. Any process on your Mac can reach it while the sandbox runs.
+- `down` stops the desktop and `start` brings it back.
+- A sandbox created without `--ui` has no desktop. Recreate it with `--ui` to get one.
+- The desktop browser has its own profile, so it doesn't conflict with Playwright scripts using `/root/browser`.
+
+## Publishing ports
+
+`--publish` makes a port inside the sandbox reachable from your Mac, at `127.0.0.1` only.
+
+```bash
+sandbox up app1 --publish 8080              # Mac 127.0.0.1:8080 -> sandbox port 8080
+sandbox up app1 --publish 9000:8080         # Mac 127.0.0.1:9000 -> sandbox port 8080
+```
+
+- The flag is repeatable. The ports are saved with the sandbox and used again when it starts.
+- Ports are set when the sandbox is created. To change them, destroy the sandbox and create it again.
+- `status` lists the published ports. `--publish` can't be combined with `--group` yet.
+- Traffic from the Mac to a published port goes straight to the sandbox and doesn't pass through the proxy. The proxy only handles the sandbox's own outbound web traffic.
+- The sandbox's firewall rules allow the Mac to reach each published port. Anything else from the Mac is still blocked.
 
 ## Upstream proxy
 

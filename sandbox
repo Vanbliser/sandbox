@@ -205,7 +205,7 @@ RUN npm install -g /opt/pw/playwright-core-1.59.1.tgz \
 RUN printf '%s\n' '#!/bin/sh' \
  'chrome=$(ls -d /opt/pw/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | head -1)' \
  '[ -n "$chrome" ] || { echo "sandbox-browser: no browser installed" >&2; exit 1; }' \
- 'exec "$chrome" --no-sandbox --disable-dev-shm-usage --no-first-run --user-data-dir=/root/browser ${HTTP_PROXY:+--proxy-server=$HTTP_PROXY} "$@"' \
+ 'exec "$chrome" --no-sandbox --disable-dev-shm-usage --no-first-run --user-data-dir=/root/browser/desktop ${HTTP_PROXY:+--proxy-server=$HTTP_PROXY} "$@"' \
     > /usr/local/bin/sandbox-browser && chmod +x /usr/local/bin/sandbox-browser \
  && mkdir -p /root/.config/openbox \
  && printf '%s\n' '<openbox_menu>' '<menu id="root-menu" label="Sandbox">' \
@@ -527,9 +527,14 @@ load_pf_anchor() {
       [[ -n "$cidr" ]] && cidrs+=("$cidr")
     done < "$dir/ips.txt"
   fi
-  local ui_arg="none"
-  if [[ -f "$dir/ui" ]]; then ui_arg="$UI_PORT"; fi
-  sudo -n "$PF_HELPER" load "$name" "$subnet" "$gateway" "$bridge" "$PROXY_PORT" "$mode" "$ui_arg" \
+  local published_arg="none" cport
+  if [[ -f "$dir/ui" ]]; then published_arg="$UI_PORT"; fi
+  if [[ -f "$dir/publish" ]]; then
+    while IFS=: read -r _ cport; do
+      if [[ "$published_arg" == "none" ]]; then published_arg="$cport"; else published_arg+=",$cport"; fi
+    done < "$dir/publish"
+  fi
+  sudo -n "$PF_HELPER" load "$name" "$subnet" "$gateway" "$bridge" "$PROXY_PORT" "$mode" "$published_arg" \
     ${cidrs[@]+"${cidrs[@]}"} >"$dir/pf.out" 2>&1 \
     || die "could not load pf rules for $name (see $dir/pf.out)"
   echo "pf rules loaded for $name ($mode mode)"
@@ -1023,10 +1028,10 @@ cmd_up() {
   [[ ! -d "$GROUP_BASE/$name" ]] || die "'$short' is the name of a group in this project. Pick another sandbox name"
 
   local mode="" mode_given=0 domains="" ips_src="" pin_src="" up_spec="" up_ca="" use_defaults=1 defaults_given=0
-  local env_args=() env_file_src="" ui=0 group_name=""
+  local env_args=() env_file_src="" ui=0 group_name="" publish_specs=() publish_norm=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -m|--mode|-d|--domains|-i|--ips|-p|--pinned|--upstream|--upstream-ca|-e|--env|--env-file|--group)
+      -m|--mode|-d|--domains|-i|--ips|-p|--pinned|--upstream|--upstream-ca|-e|--env|--env-file|--group|--publish)
         [[ $# -ge 2 ]] || die "$1 needs a value"
         case "$1" in
           -m|--mode) mode="$2"; mode_given=1 ;;
@@ -1035,6 +1040,7 @@ cmd_up() {
           --upstream) up_spec="$2" ;;
           --upstream-ca) up_ca="$2" ;;
           --group) group_name="$2" ;;
+          --publish) publish_specs+=("$2") ;;
           -e|--env) env_args+=("$2") ;;
           --env-file) env_file_src="$2" ;;
           *) ips_src="$2" ;;
@@ -1086,6 +1092,20 @@ cmd_up() {
     if [[ -z "$env_file_src" && ${#env_args[@]} -eq 0 && -f "$dir/env" ]]; then env_file_src="$dir/env"; fi
     if [[ -f "$dir/ui" ]]; then ui=1; fi
     if [[ $defaults_given -eq 0 && -f "$dir/defaults" ]]; then use_defaults="$(cat "$dir/defaults")"; fi
+    if [[ ${#publish_specs[@]} -eq 0 && -f "$dir/publish" ]]; then
+      while IFS= read -r p; do publish_specs+=("$p"); done < "$dir/publish"
+    fi
+  fi
+  for spec in ${publish_specs[@]+"${publish_specs[@]}"}; do
+    [[ "$spec" =~ ^([0-9]{1,5})(:([0-9]{1,5}))?$ ]] || die "--publish takes PORT or HOST_PORT:CONTAINER_PORT (got '$spec')"
+    hport="${BASH_REMATCH[1]}"; cport="${BASH_REMATCH[3]:-$hport}"
+    (( 10#$hport >= 1 && 10#$hport <= 65535 && 10#$cport >= 1 && 10#$cport <= 65535 )) \
+      || die "port out of range in --publish '$spec'"
+    [[ "$hport" != "$UI_PORT" ]] || die "--publish can't use port $UI_PORT, the sandbox interface's port"
+    publish_norm+=("$hport:$cport")
+  done
+  if [[ -n "$group_name" && ${#publish_norm[@]} -gt 0 ]]; then
+    die "--publish can't be used with --group yet. Publish from a sandbox outside a group"
   fi
   mode="${mode:-both}"
 
@@ -1183,6 +1203,7 @@ cmd_up() {
   chmod 755 "$dir/sessions"
   local publish=()
   if (( ui )); then publish=(-p "127.0.0.1:$UI_PORT:$UI_PORT"); fi
+  for spec in ${publish_norm[@]+"${publish_norm[@]}"}; do publish+=(-p "127.0.0.1:${spec%%:*}:${spec##*:}"); done
   container run -d --name "$container" --network "$network" \
     -v "$dir/browser:/root/browser" -v "$dir/sessions:/root/sessions:ro" ${publish[@]+"${publish[@]}"} ${run_env[@]+"${run_env[@]}"} "$SANDBOX_IMAGE" tail -f /dev/null >/dev/null \
     || die "failed to start container $container"
@@ -1198,6 +1219,7 @@ cmd_up() {
   cp "$work/env" "$dir/env"
   chmod 600 "$dir/env"
   if (( ui )); then echo 1 > "$dir/ui"; else rm -f "$dir/ui"; fi
+  if (( ${#publish_norm[@]} )); then printf '%s\n' "${publish_norm[@]}" > "$dir/publish"; else rm -f "$dir/publish"; fi
 
   if [[ -z "$group_full" && "$mode" != "network" ]]; then
     cp "$work/engagement" "$dir/engagement.txt"
@@ -1433,6 +1455,7 @@ cmd_status() {
   fi
   if [[ -f "$dir/env" ]]; then echo "env:       $(grep -c . "$dir/env" || true) variable(s) set (values not shown)"; fi
   echo "pf rules:  $rules loaded"
+  if [[ -f "$dir/publish" ]]; then echo "published: $(tr '\n' ' ' < "$dir/publish")(on 127.0.0.1)"; fi
   echo "subnet:    $(json_field "$dir/state.json" subnet)  gateway: $(json_field "$dir/state.json" gateway)"
 }
 
@@ -1670,13 +1693,14 @@ Once per project folder:
   init                                        make this folder a sandbox project
 
 Inside a project (the project is found from the current folder):
-  up <name> [-m web|network|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port> [--upstream-ca <pem>]] [--no-defaults]
+  up <name> [-m web|network|both] [-d <file>] [-i <file>] [-p <file>] [--upstream <host:port> [--upstream-ca <pem>]] [--publish <port>[:<cport>]] [--no-defaults]
         -m   mode, default both
         -d   domain file (web and both). Optional: an empty list is created if it's missing
         -i   IP file (network and both). Optional: an empty list is created if it's missing
         -p   pinned-host file (web and both). Hosts must also be in the domain list
         --upstream <host:port>    send web through another proxy, such as Burp (web and both)
         --upstream-ca <pem>       CA that the upstream proxy signs with, PEM or DER (needs --upstream)
+        --publish <port>[:<cport>]  reach port <cport> of the sandbox at 127.0.0.1 on this Mac (repeatable; not with --group)
         -e NAME=VALUE             environment variable for the sandbox (repeatable). Values are not printed
         --env-file <file>         NAME=VALUE lines. -e entries override it
         --ui                      start the sandbox interface on 127.0.0.1:6080 (no password) for manual logins

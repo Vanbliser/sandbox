@@ -2,9 +2,10 @@
 # The only privileged entry point for the sandbox tool. Installed root-owned at
 # /usr/local/libexec/sandbox-pf. Commands, all for one sandbox anchor:
 #
-#   load <name> <subnet> <gateway> <bridge> <port> <mode> <vnc-port|none> [cidr ...]
+#   load <name> <subnet> <gateway> <bridge> <port> <mode> <published|none> [cidr ...]
 #         mode: web | network | both | both-open. The CIDR list is only used for network and both.
-#         vnc-port: lets the Mac (the sandbox gateway) reach the sandbox's VNC server on that port.
+#         published: comma-separated container ports the Mac (the sandbox gateway) may reach,
+#         for the sandbox interface and for --publish.
 #   show <name>
 #   flush <name>
 #   capture-start <name> <logfile>   records pf log entries for the sandbox to <logfile>
@@ -21,13 +22,12 @@ anchor="com.apple/sandbox-$name"
 
 case "$cmd" in
   load)
-    subnet="${3:-}"; gateway="${4:-}"; bridge="${5:-}"; port="${6:-}"; mode="${7:-}"; vnc="${8:-}"
+    subnet="${3:-}"; gateway="${4:-}"; bridge="${5:-}"; port="${6:-}"; mode="${7:-}"; published="${8:-}"
     [[ "$subnet" =~ ^192\.168\.(20[0-9]|2[1-4][0-9]|250)\.0/24$ ]] || die "subnet outside the sandbox pool"
     [[ "$gateway" == "${subnet%.0/24}.1" ]] || die "gateway does not match subnet"
     [[ "$bridge" =~ ^bridge[0-9]{1,4}$ ]] || die "invalid bridge name"
     [[ "$port" == "3128" ]] || die "invalid proxy port"
     case "$mode" in web|network|both|both-open) ;; *) die "invalid mode" ;; esac
-    [[ "$vnc" == "none" || ( "$vnc" =~ ^[0-9]{1,5}$ && 10#$vnc -ge 1 && 10#$vnc -le 65535 ) ]] || die "invalid VNC port"
 
     /sbin/ifconfig pflog0 >/dev/null 2>&1 || /sbin/ifconfig pflog0 create
 
@@ -36,8 +36,12 @@ case "$cmd" in
       rules="pass quick on $bridge proto tcp from $subnet to $gateway port $port keep state"
     fi
     rules+=$'\n'"block drop log quick on $bridge proto udp from $subnet to any port 53"
-    if [[ "$vnc" != "none" ]]; then
-      rules+=$'\n'"pass quick on $bridge proto tcp from $gateway to $subnet port $vnc keep state"
+    if [[ "$published" != "none" ]]; then
+      IFS=, read -r -a ports <<< "$published"
+      for p in "${ports[@]}"; do
+        [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )) || die "invalid published port: $p"
+        rules+=$'\n'"pass quick on $bridge proto tcp from $gateway to $subnet port $p keep state"
+      done
     fi
 
     if [[ "$mode" != "web" ]]; then
